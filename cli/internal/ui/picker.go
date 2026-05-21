@@ -6,7 +6,7 @@ import (
 	"sort"
 
 	"github.com/charmbracelet/huh"
-	"github.com/tun0access/tun0access/internal/backend"
+	"github.com/KatrielMoses/tun0access/internal/backend"
 )
 
 // CountryEntry is one row in the picker.

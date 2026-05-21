@@ -7,7 +7,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
-	"github.com/tun0access/tun0access/internal/backend"
+	"github.com/KatrielMoses/tun0access/internal/backend"
 )
 
 var listCmd = &cobra.Command{

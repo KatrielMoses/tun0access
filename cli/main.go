@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/tun0access/tun0access/cmd"
+	"github.com/KatrielMoses/tun0access/cmd"
 )
 
 func main() {

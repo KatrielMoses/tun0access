@@ -5,8 +5,8 @@ import (
 	"runtime"
 
 	"github.com/spf13/cobra"
-	"github.com/tun0access/tun0access/internal/backend"
-	"github.com/tun0access/tun0access/internal/openvpn"
+	"github.com/KatrielMoses/tun0access/internal/backend"
+	"github.com/KatrielMoses/tun0access/internal/openvpn"
 )
 
 var doctorCmd = &cobra.Command{

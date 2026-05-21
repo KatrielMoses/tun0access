@@ -1,4 +1,4 @@
-module github.com/tun0access/tun0access
+module github.com/KatrielMoses/tun0access
 
 go 1.25
 
