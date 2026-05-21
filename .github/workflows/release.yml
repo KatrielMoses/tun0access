@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { os: linux,   arch: amd64 }
+          - { os: linux,   arch: arm64 }
+          - { os: linux,   arch: arm   }
+          - { os: darwin,  arch: amd64 }
+          - { os: darwin,  arch: arm64 }
+          - { os: windows, arch: amd64 }
+          - { os: windows, arch: arm64 }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+          cache-dependency-path: cli/go.sum
+
+      - name: Build
+        working-directory: cli
+        env:
+          GOOS:        ${{ matrix.os }}
+          GOARCH:      ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          BIN=tun0access
+          [ "${{ matrix.os }}" = "windows" ] && BIN=tun0access.exe
+          go build -trimpath -ldflags="-s -w -X main.version=${{ github.ref_name }}" -o "../dist/${BIN}" .
+
+      - name: Package (Unix)
+        if: matrix.os != 'windows'
+        run: |
+          cd dist
+          tar -czf "tun0access_${{ matrix.os }}_${{ matrix.arch }}.tar.gz" tun0access
+          rm tun0access
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows'
+        run: |
+          cd dist
+          zip "tun0access_windows_${{ matrix.arch }}.zip" tun0access.exe
+          rm tun0access.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+          generate_release_notes: true
