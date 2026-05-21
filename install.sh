@@ -46,7 +46,7 @@ VERSION=$($FETCH "https://api.github.com/repos/${REPO}/releases/latest" \
   | grep '"tag_name"' | head -1 | cut -d'"' -f4)
 
 if [ -z "$VERSION" ]; then
-  echo "Could not determine latest version. Check https://github.com/${REPO}/releases" >&2
+  echo "Could not determine latest version. Check https://github.com/KatrielMoses/tun0access/releases" >&2
   exit 1
 fi
 
