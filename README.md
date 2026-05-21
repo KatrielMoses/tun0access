@@ -31,11 +31,15 @@ Tsukuba's free public relay pool). The plug-in interface is in place; see
 ## Install
 
 ```sh
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/KatrielMoses/tun0access/main/install.sh | sh
+
+# Windows PowerShell (elevated)
+irm https://raw.githubusercontent.com/KatrielMoses/tun0access/main/install.ps1 | iex
+
 # from source (requires Go 1.25+)
 cd cli && go build -o tun0access .
 ```
-
-Binaries via `go install`/Releases coming once the module path is finalized.
 
 `tun0access` needs the OpenVPN community client. It will offer to install it
 on first run via:

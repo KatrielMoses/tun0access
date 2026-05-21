@@ -6,7 +6,7 @@
 # added to the user PATH permanently.
 
 $ErrorActionPreference = "Stop"
-$Repo   = "tun0access/tun0access"
+$Repo   = "KatrielMoses/tun0access"
 $BinDir = Join-Path $env:LOCALAPPDATA "tun0access"
 
 # ── detect arch ──────────────────────────────────────────────────────────────

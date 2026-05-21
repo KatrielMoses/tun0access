@@ -3,7 +3,7 @@
 # Usage:  curl -fsSL https://raw.githubusercontent.com/tun0access/tun0access/main/install.sh | sh
 set -e
 
-REPO="tun0access/tun0access"
+REPO="KatrielMoses/tun0access"
 BIN="tun0access"
 INSTALL_DIR="/usr/local/bin"
 
