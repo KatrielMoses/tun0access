@@ -8,61 +8,72 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+
+	"github.com/KatrielMoses/tun0access/internal/runtools"
 )
 
+// RunOptions configures a sing-box session.
+type RunOptions struct {
+	Binary  string
+	Out     *Outbound
+	Verbose bool
+	OnReady func()
+}
+
 // Run builds a sing-box config from the parsed Outbound, writes it to a temp
-// file, and runs sing-box as a child process. The TUN inbound creates a
-// system network interface and auto_route forwards all traffic through the
-// outbound — the user is effectively VPN'd through the chosen server.
-//
-// Requires admin/root because creating a TUN device is privileged. On
-// Linux/macOS we re-exec via sudo if not already root.
-func Run(ctx context.Context, singBoxBin string, out *Outbound) error {
-	cfg, err := buildConfig(out)
+// file, and runs sing-box as a child process. Returns the captured output
+// and the subprocess exit error. Creating the TUN device requires admin/root.
+func Run(ctx context.Context, opts RunOptions) (string, error) {
+	if opts.Binary == "" {
+		return "", fmt.Errorf("sing-box binary path is empty")
+	}
+	if opts.Out == nil {
+		return "", fmt.Errorf("nil outbound")
+	}
+
+	cfg, err := buildConfig(opts.Out)
 	if err != nil {
-		return fmt.Errorf("build sing-box config: %w", err)
+		return "", fmt.Errorf("build sing-box config: %w", err)
 	}
 
 	dir, err := os.MkdirTemp("", "tun0access-sb-*")
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer os.RemoveAll(dir)
 	cfgPath := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(cfgPath, cfg, 0o600); err != nil {
-		return err
+		return "", err
 	}
 
 	args := []string{"run", "-c", cfgPath}
-	name := singBoxBin
+	name := opts.Binary
 	if runtime.GOOS != "windows" && os.Geteuid() != 0 {
 		if _, lerr := exec.LookPath("sudo"); lerr == nil {
-			args = append([]string{"-E", singBoxBin}, args...)
+			args = append([]string{"-E", opts.Binary}, args...)
 			name = "sudo"
 		}
 	}
 
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("sing-box exited: %w", err)
-	}
-	return nil
+	return runtools.Run(ctx, runtools.Options{
+		Cmd:     cmd,
+		Verbose: opts.Verbose,
+		OnReady: opts.OnReady,
+		UserOut: os.Stderr,
+	})
 }
 
 // singBoxConfig is a partial sing-box v1.x JSON config — only the fields we
 // actually populate.
 type singBoxConfig struct {
-	Log      map[string]any `json:"log"`
-	DNS      map[string]any `json:"dns"`
-	Inbounds []any          `json:"inbounds"`
-	Outbounds []any         `json:"outbounds"`
-	Route    map[string]any `json:"route"`
+	Log       map[string]any `json:"log"`
+	DNS       map[string]any `json:"dns"`
+	Inbounds  []any          `json:"inbounds"`
+	Outbounds []any          `json:"outbounds"`
+	Route     map[string]any `json:"route"`
 }
 
-// buildConfig translates a parsed Outbound into a runnable sing-box config.
 func buildConfig(out *Outbound) ([]byte, error) {
 	outbound, err := outboundConfig(out)
 	if err != nil {
@@ -71,26 +82,23 @@ func buildConfig(out *Outbound) ([]byte, error) {
 
 	cfg := singBoxConfig{
 		Log: map[string]any{"level": "warn", "timestamp": true},
+		// sing-box 1.12+ DNS format: type/server fields instead of legacy address.
 		DNS: map[string]any{
 			"servers": []any{
-				map[string]any{"tag": "remote", "address": "1.1.1.1", "detour": "proxy"},
-				map[string]any{"tag": "local", "address": "local", "detour": "direct"},
-			},
-			"rules": []any{
-				map[string]any{"clash_mode": "direct", "server": "local"},
-				map[string]any{"clash_mode": "global", "server": "remote"},
+				map[string]any{"tag": "remote", "type": "udp", "server": "1.1.1.1", "detour": "proxy"},
+				map[string]any{"tag": "local", "type": "local"},
 			},
 			"final": "remote",
 		},
 		Inbounds: []any{
 			map[string]any{
-				"type":            "tun",
-				"tag":             "tun-in",
-				"address":         []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"},
-				"auto_route":      true,
-				"strict_route":    true,
-				"stack":           "mixed",
-				"sniff":           true,
+				"type":         "tun",
+				"tag":          "tun-in",
+				"address":      []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"},
+				"auto_route":   true,
+				"strict_route": true,
+				"stack":        "mixed",
+				"sniff":        true,
 			},
 		},
 		Outbounds: []any{
@@ -109,8 +117,6 @@ func buildConfig(out *Outbound) ([]byte, error) {
 	return json.MarshalIndent(cfg, "", "  ")
 }
 
-// outboundConfig produces the protocol-specific outbound block. The tag is
-// always "proxy" so the routing rules don't have to know the protocol.
 func outboundConfig(o *Outbound) (map[string]any, error) {
 	base := map[string]any{
 		"tag":         "proxy",
@@ -158,7 +164,6 @@ func outboundConfig(o *Outbound) (map[string]any, error) {
 		if tls != nil {
 			base["tls"] = tls
 		} else {
-			// trojan mandates TLS
 			base["tls"] = map[string]any{"enabled": true, "insecure": true}
 		}
 	default:
@@ -167,7 +172,6 @@ func outboundConfig(o *Outbound) (map[string]any, error) {
 	return base, nil
 }
 
-// buildTransport returns the sing-box transport block, or nil for plain TCP.
 func buildTransport(o *Outbound) map[string]any {
 	switch o.Network {
 	case "ws":

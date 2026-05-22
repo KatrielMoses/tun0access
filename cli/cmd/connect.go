@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/KatrielMoses/tun0access/internal/backend"
+	"github.com/KatrielMoses/tun0access/internal/diagnose"
 	"github.com/KatrielMoses/tun0access/internal/openvpn"
 	"github.com/KatrielMoses/tun0access/internal/proxy"
 	"github.com/KatrielMoses/tun0access/internal/ui"
@@ -21,6 +23,7 @@ var (
 	flagCountry   string
 	flagBackend   string
 	flagNoInstall bool
+	flagVerbose   bool
 )
 
 var connectCmd = &cobra.Command{
@@ -31,8 +34,9 @@ a country, then dispatches to the right engine (openvpn for VPN protocols,
 sing-box for shadowsocks / vmess / vless / trojan). Foreground process —
 Ctrl-C disconnects.
 
-  tun0access connect          # interactive picker
-  tun0access connect JP       # connect to Japan, pick best server`,
+  tun0access connect            # interactive picker
+  tun0access connect JP         # connect to Japan, pick best server
+  tun0access connect JP -v      # same, with raw engine output for debugging`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runConnect,
 }
@@ -41,6 +45,7 @@ func init() {
 	connectCmd.Flags().StringVar(&flagCountry, "country", "", "ISO-3166 alpha-2 country code (e.g. JP, US)")
 	connectCmd.Flags().StringVar(&flagBackend, "backend", "", "restrict to a single backend (e.g. vpngate, riseup, ss-aggregator)")
 	connectCmd.Flags().BoolVar(&flagNoInstall, "no-install", false, "do not auto-install openvpn or sing-box if missing")
+	connectCmd.Flags().BoolVarP(&flagVerbose, "verbose", "v", false, "show raw engine output (openvpn / sing-box logs)")
 }
 
 func runConnect(cmd *cobra.Command, args []string) error {
@@ -82,30 +87,50 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	if chosen == nil {
 		return fmt.Errorf("no servers available for country %q", cc)
 	}
-	fmt.Printf("• Connecting via %s (%s) — backend=%s, protocol=%s, score=%d\n",
-		chosen.CountryLong, chosen.CountryShort, chosen.Backend, chosen.Protocol, chosen.Score)
-	fmt.Println("  Ctrl-C to disconnect.")
-	fmt.Println()
+	fmt.Printf("• Connecting via %s (%s) — backend=%s, protocol=%s\n",
+		chosen.CountryLong, chosen.CountryShort, chosen.Backend, chosen.Protocol)
 
-	switch chosen.Protocol {
+	output, runErr := dispatchEngine(ctx, chosen)
+
+	// Ctrl-C is the normal way to disconnect — don't treat it as failure.
+	if ctx.Err() != nil {
+		fmt.Println("\n• Disconnected.")
+		return nil
+	}
+	if runErr == nil {
+		return nil
+	}
+	reportFailure(chosen, output, runErr)
+	return ErrSilent
+}
+
+// ErrSilent is returned when runConnect has already printed a user-facing
+// message and main() should exit non-zero without adding more output.
+var ErrSilent = errors.New("silent")
+
+func dispatchEngine(ctx context.Context, s *backend.Server) (string, error) {
+	switch s.Protocol {
 	case "openvpn":
-		return runOpenVPN(ctx, chosen)
+		return runOpenVPN(ctx, s)
 	case "shadowsocks", "vmess", "vless", "trojan":
-		return runSingBox(ctx, chosen)
+		return runSingBox(ctx, s)
 	default:
-		return fmt.Errorf("unknown protocol %q on server %s", chosen.Protocol, chosen.ID)
+		return "", fmt.Errorf("unknown protocol %q on server %s", s.Protocol, s.ID)
 	}
 }
 
-func runOpenVPN(ctx context.Context, s *backend.Server) error {
-	fmt.Println("• Checking for openvpn…")
+func runOpenVPN(ctx context.Context, s *backend.Server) (string, error) {
 	bin, err := openvpn.EnsureInstalled(ctx, !flagNoInstall)
 	if err != nil {
-		return err
+		return "", err
 	}
-	fmt.Println("  found:", bin)
-
-	opts := openvpn.RunOptions{Binary: bin, Config: s.Config}
+	fmt.Println("• Engine: openvpn — establishing tunnel (this can take 10-30s)…")
+	opts := openvpn.RunOptions{
+		Binary:  bin,
+		Config:  s.Config,
+		Verbose: flagVerbose,
+		OnReady: func() { fmt.Println("• Connected ✓ — Ctrl-C to disconnect") },
+	}
 	if s.Credentials != nil {
 		opts.Credentials = &openvpn.Credentials{
 			Username: s.Credentials.Username,
@@ -115,19 +140,59 @@ func runOpenVPN(ctx context.Context, s *backend.Server) error {
 	return openvpn.Run(ctx, opts)
 }
 
-func runSingBox(ctx context.Context, s *backend.Server) error {
-	fmt.Println("• Preparing sing-box…")
+func runSingBox(ctx context.Context, s *backend.Server) (string, error) {
 	bin, err := proxy.EnsureSingBox(ctx)
 	if err != nil {
-		return fmt.Errorf("sing-box: %w", err)
+		return "", fmt.Errorf("sing-box: %w", err)
 	}
-	fmt.Println("  found:", bin)
-
 	var out proxy.Outbound
 	if err := json.Unmarshal(s.Config, &out); err != nil {
-		return fmt.Errorf("unmarshal outbound: %w", err)
+		return "", fmt.Errorf("unmarshal outbound: %w", err)
 	}
-	return proxy.Run(ctx, bin, &out)
+	fmt.Println("• Engine: sing-box — establishing tunnel…")
+	return proxy.Run(ctx, proxy.RunOptions{
+		Binary:  bin,
+		Out:     &out,
+		Verbose: flagVerbose,
+		OnReady: func() { fmt.Println("• Connected ✓ — Ctrl-C to disconnect") },
+	})
+}
+
+// reportFailure prints a friendly diagnosis for a failed connection. If the
+// captured output matches a known pattern we attribute fault and suggest an
+// action; otherwise we hint at -v for raw logs.
+func reportFailure(s *backend.Server, output string, runErr error) {
+	fmt.Println()
+	d := diagnose.Recognise(output)
+	if d == nil {
+		fmt.Println("✗ Connection failed (unrecognised error).")
+		fmt.Println("  Run again with -v to see the engine's raw output.")
+		if !flagVerbose {
+			fmt.Println("  Or try another country — free servers come and go.")
+		} else {
+			fmt.Println("  Underlying error:", runErr)
+		}
+		return
+	}
+
+	icon := "✗"
+	prefix := "Connection failed"
+	switch d.Fault {
+	case diagnose.FaultServer:
+		prefix = "This server is broken"
+	case diagnose.FaultUser:
+		prefix = "Action needed"
+	case diagnose.FaultOurs:
+		icon = "!"
+		prefix = "tun0access bug"
+	}
+
+	fmt.Printf("%s %s — %s\n", icon, prefix, d.Summary)
+	fmt.Printf("  → %s\n", d.Action)
+
+	if flagVerbose {
+		fmt.Println("\n  Raw exit error:", runErr)
+	}
 }
 
 // pickServer chooses among the top 5 servers in a country at random so we
