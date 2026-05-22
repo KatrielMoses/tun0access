@@ -110,10 +110,14 @@ func buildConfig(out *Outbound) ([]byte, error) {
 		Route: map[string]any{
 			"auto_detect_interface": true,
 			"final":                 "proxy",
+			// default_domain_resolver was implicit before sing-box 1.12 and is
+			// now required. Resolve outbound hostnames via local DNS because
+			// the tunnel isn't up yet at outbound-dial time.
+			"default_domain_resolver": "local",
 			"rules": []any{
 				map[string]any{"action": "sniff"},
 				map[string]any{"protocol": "dns", "action": "hijack-dns"},
-				map[string]any{"ip_is_private": true, "outbound": "direct"},
+				map[string]any{"ip_is_private": true, "action": "route", "outbound": "direct"},
 			},
 		},
 	}

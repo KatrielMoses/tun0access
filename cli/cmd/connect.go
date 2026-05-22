@@ -193,6 +193,15 @@ func reportFailure(s *backend.Server, output string, runErr error) {
 	fmt.Printf("%s %s — %s\n", icon, prefix, d.Summary)
 	fmt.Printf("  → %s\n", d.Action)
 
+	// For "ours" diagnoses (tun0access bugs) always surface the underlying
+	// line so reports back to us are immediately actionable. Server/user
+	// faults don't need this — the summary already tells the user what to do.
+	if d.Fault == diagnose.FaultOurs {
+		if hint := lastMeaningfulLine(output); hint != "" {
+			fmt.Println("  Underlying:", hint)
+		}
+	}
+
 	if flagVerbose {
 		fmt.Println("\n  Raw exit error:", runErr)
 	}
