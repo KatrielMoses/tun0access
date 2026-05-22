@@ -15,6 +15,7 @@ import (
 
 	"github.com/KatrielMoses/tun0access/internal/backend"
 	"github.com/KatrielMoses/tun0access/internal/diagnose"
+	"github.com/KatrielMoses/tun0access/internal/exitcheck"
 	"github.com/KatrielMoses/tun0access/internal/openvpn"
 	"github.com/KatrielMoses/tun0access/internal/proxy"
 	"github.com/KatrielMoses/tun0access/internal/runtools"
@@ -223,7 +224,25 @@ func attemptConnect(parentCtx context.Context, s *backend.Server) (string, error
 				cancelRun()
 				return
 			}
-			fmt.Printf("  ✓ %.2f Mbps — ready. Ctrl-C to disconnect.\n", res.Mbps)
+
+			// Speed is fine. Now check where we ACTUALLY exit — server
+			// labels lie all the time (CDN-fronted, mislabelled, etc.) and
+			// the user cares about the exit, not the label.
+			exit, exitErr := exitcheck.Where(runCtx)
+			if exitErr != nil {
+				// Exit check failed — show speed only and keep going.
+				fmt.Printf("  ✓ %.2f Mbps — ready. Ctrl-C to disconnect.\n", res.Mbps)
+				return
+			}
+			if exit.CountryCode != s.CountryShort {
+				fmt.Printf("  ⚠ %.2f Mbps — but you're exiting in %s (%s), not %s as labelled.\n",
+					res.Mbps, exit.City, exit.CountryCode, s.CountryShort)
+				fmt.Println("    (Free-config servers are often CDN-fronted or mislabelled.)")
+				fmt.Println("    Ctrl-C to disconnect and try another, or stay if this works for you.")
+				return
+			}
+			fmt.Printf("  ✓ %.2f Mbps — exit in %s (%s). Ctrl-C to disconnect.\n",
+				res.Mbps, exit.City, exit.CountryCode)
 		}()
 	}
 
