@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -17,33 +18,41 @@ import (
 	"github.com/KatrielMoses/tun0access/internal/openvpn"
 	"github.com/KatrielMoses/tun0access/internal/proxy"
 	"github.com/KatrielMoses/tun0access/internal/runtools"
+	"github.com/KatrielMoses/tun0access/internal/speedtest"
 	"github.com/KatrielMoses/tun0access/internal/ui"
 	"github.com/spf13/cobra"
 )
 
-// readyDeadline bounds the "connecting…" phase. If neither engine reaches its
-// success marker in this time, we kill it and tell the user the server is
-// dead. Beats the previous behaviour of hanging silently for 15 minutes.
-const readyDeadline = 45 * time.Second
+const (
+	// readyDeadline bounds the "connecting…" phase of each attempt.
+	readyDeadline = 45 * time.Second
+	// maxAttempts is the per-country retry ceiling. Beyond this, the user
+	// gets a clear "all servers in <country> are dead" message and can pick
+	// a different country.
+	maxAttempts = 3
+)
 
 var (
 	flagCountry   string
 	flagBackend   string
 	flagNoInstall bool
 	flagVerbose   bool
+	flagNoProbe   bool
 )
 
 var connectCmd = &cobra.Command{
 	Use:   "connect [country-code]",
 	Short: "Connect to a free VPN / proxy server (optionally pinned to a country)",
-	Long: `Fetches the current server list from every enabled backend, lets you pick
-a country, then dispatches to the right engine (openvpn for VPN protocols,
-sing-box for shadowsocks / vmess / vless / trojan). Foreground process —
-Ctrl-C disconnects.
+	Long: `Fetches the current server list, lets you pick a country, then dispatches
+to the right engine (openvpn for VPN protocols, sing-box for shadowsocks /
+vmess / vless / trojan). After the engine reports ready we run a quick
+bandwidth probe through the tunnel; if the server is too slow we silently
+try another one. Foreground process — Ctrl-C disconnects.
 
   tun0access connect            # interactive picker
   tun0access connect JP         # connect to Japan, pick best server
-  tun0access connect JP -v      # same, with raw engine output for debugging`,
+  tun0access connect JP -v      # same, with raw engine output for debugging
+  tun0access connect --no-probe # skip the bandwidth check (one shot)`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runConnect,
 }
@@ -53,6 +62,7 @@ func init() {
 	connectCmd.Flags().StringVar(&flagBackend, "backend", "", "restrict to a single backend (e.g. vpngate, riseup, ss-aggregator)")
 	connectCmd.Flags().BoolVar(&flagNoInstall, "no-install", false, "do not auto-install openvpn or sing-box if missing")
 	connectCmd.Flags().BoolVarP(&flagVerbose, "verbose", "v", false, "show raw engine output (openvpn / sing-box logs)")
+	connectCmd.Flags().BoolVar(&flagNoProbe, "no-probe", false, "skip the post-connect bandwidth probe and auto-retry")
 }
 
 func runConnect(cmd *cobra.Command, args []string) error {
@@ -90,95 +100,190 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		cc = picked
 	}
 
-	chosen := pickServer(servers, cc)
-	if chosen == nil {
-		return fmt.Errorf("no servers available for country %q", cc)
-	}
-	fmt.Printf("• Connecting via %s (%s) — backend=%s, protocol=%s\n",
-		chosen.CountryLong, chosen.CountryShort, chosen.Backend, chosen.Protocol)
+	// Retry loop: try up to maxAttempts servers in the chosen country. Each
+	// attempt = pick a server, connect, probe; on probe failure mark the
+	// server attempted and loop. Stop early on user Ctrl-C or hard error.
+	attempted := map[string]bool{}
+	var lastReason string
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		chosen := pickServer(servers, cc, attempted)
+		if chosen == nil {
+			break
+		}
+		attempted[chosen.ID] = true
 
-	output, runErr := dispatchEngine(ctx, chosen)
+		fmt.Printf("• Attempt %d/%d: %s (%s) — backend=%s, protocol=%s\n",
+			attempt, maxAttempts, chosen.CountryLong, chosen.CountryShort, chosen.Backend, chosen.Protocol)
 
-	// Ctrl-C is the normal way to disconnect — don't treat it as failure.
-	if ctx.Err() != nil {
-		fmt.Println("\n• Disconnected.")
-		return nil
+		output, runErr, verdict := attemptConnect(ctx, chosen)
+
+		// User Ctrl-C? Stop cleanly — Ctrl-C wins over every other outcome.
+		if ctx.Err() != nil {
+			fmt.Println("• Disconnected.")
+			return nil
+		}
+
+		// Probe verdicts and engine errors are mutually exclusive in
+		// practice — we cancelled engine only because probe was bad, so
+		// engine's "error" is context.Canceled which we ignore.
+		switch verdict {
+		case verdictGood:
+			// Engine exited on its own. Either Ctrl-C path raced with us,
+			// or the engine died after a healthy probe. Treat as done.
+			return nil
+		case verdictSlow:
+			lastReason = fmt.Sprintf("server too slow (~%.2f Mbps)", lastMbps.Load()/100)
+			continue
+		case verdictUnreachable:
+			lastReason = "tunnel up but couldn't reach the internet"
+			continue
+		case verdictEngineFailed:
+			// Engine itself blew up — bad config, bad creds, dead handshake.
+			// Don't retry; show the diagnosis and bail.
+			reportFailure(chosen, output, runErr)
+			return ErrSilent
+		}
 	}
-	if runErr == nil {
-		return nil
+
+	if lastReason == "" {
+		fmt.Printf("\n✗ No more servers to try in %s.\n", cc)
+		return ErrSilent
 	}
-	reportFailure(chosen, output, runErr)
+	fmt.Printf("\n✗ Tried %d servers in %s — all unusable (last: %s).\n", maxAttempts, cc, lastReason)
+	fmt.Println("  → Try a different country, or re-run later — free servers come and go.")
 	return ErrSilent
 }
 
-// ErrSilent is returned when runConnect has already printed a user-facing
-// message and main() should exit non-zero without adding more output.
-var ErrSilent = errors.New("silent")
+type verdict int
 
-func dispatchEngine(ctx context.Context, s *backend.Server) (string, error) {
+const (
+	verdictGood         verdict = iota // engine ran to its natural end (Ctrl-C / graceful)
+	verdictSlow                        // probe came back under MinUsableMbps
+	verdictUnreachable                 // probe failed entirely
+	verdictEngineFailed                // engine crashed before we could probe
+)
+
+// lastMbps stores the most recent measured throughput (×100, fixed-point) so
+// retry messages can quote it without complex value passing. It's reset per
+// attempt.
+var lastMbps atomic.Int64
+
+// attemptConnect runs one connection attempt: start engine, on ready run a
+// probe in the background, cancel engine if probe is bad. Returns captured
+// engine output, the engine's exit error, and a verdict the loop uses.
+func attemptConnect(parentCtx context.Context, s *backend.Server) (string, error, verdict) {
+	// Two flags the probe goroutine sets so the caller knows why the engine
+	// stopped.
+	var (
+		probeRan    atomic.Bool
+		probeSlow   atomic.Bool
+		probeFailed atomic.Bool
+	)
+
+	// Engine context: we cancel it from the probe when the server is bad.
+	runCtx, cancelRun := context.WithCancel(parentCtx)
+	defer cancelRun()
+
+	onReady := func() {
+		if flagNoProbe {
+			fmt.Println("• Connected ✓ — Ctrl-C to disconnect")
+			return
+		}
+		fmt.Println("• Connected ✓ — testing tunnel…")
+		go func() {
+			res, err := speedtest.Probe(runCtx)
+			probeRan.Store(true)
+			if err != nil {
+				fmt.Println("  ✗ Tunnel up but the test request failed:", err)
+				probeFailed.Store(true)
+				cancelRun()
+				return
+			}
+			lastMbps.Store(int64(res.Mbps * 100))
+			if !res.IsUsable() {
+				fmt.Printf("  ✗ Too slow (%.2f Mbps) — trying another server…\n", res.Mbps)
+				probeSlow.Store(true)
+				cancelRun()
+				return
+			}
+			fmt.Printf("  ✓ %.2f Mbps — ready. Ctrl-C to disconnect.\n", res.Mbps)
+		}()
+	}
+
+	output, runErr := dispatchEngine(runCtx, s, onReady)
+
+	// If the user Ctrl-C'd, the parent ctx is also done — short-circuit.
+	if parentCtx.Err() != nil {
+		return output, runErr, verdictGood
+	}
+	if probeSlow.Load() {
+		return output, runErr, verdictSlow
+	}
+	if probeFailed.Load() {
+		return output, runErr, verdictUnreachable
+	}
+	// Engine exited before probe even started (or before it finished and
+	// without us cancelling). That's an engine-side failure.
+	if !probeRan.Load() && runErr != nil {
+		return output, runErr, verdictEngineFailed
+	}
+	return output, runErr, verdictGood
+}
+
+func dispatchEngine(ctx context.Context, s *backend.Server, onReady func()) (string, error) {
 	switch s.Protocol {
 	case "openvpn":
-		return runOpenVPN(ctx, s)
+		bin, err := openvpn.EnsureInstalled(ctx, !flagNoInstall)
+		if err != nil {
+			return "", err
+		}
+		fmt.Println("• Engine: openvpn — establishing tunnel (can take 10-30s)…")
+		opts := openvpn.RunOptions{
+			Binary:        bin,
+			Config:        s.Config,
+			Verbose:       flagVerbose,
+			OnReady:       onReady,
+			ReadyDeadline: readyDeadline,
+		}
+		if s.Credentials != nil {
+			opts.Credentials = &openvpn.Credentials{
+				Username: s.Credentials.Username,
+				Password: s.Credentials.Password,
+			}
+		}
+		return openvpn.Run(ctx, opts)
+
 	case "shadowsocks", "vmess", "vless", "trojan":
-		return runSingBox(ctx, s)
+		bin, err := proxy.EnsureSingBox(ctx)
+		if err != nil {
+			return "", fmt.Errorf("sing-box: %w", err)
+		}
+		var out proxy.Outbound
+		if err := json.Unmarshal(s.Config, &out); err != nil {
+			return "", fmt.Errorf("unmarshal outbound: %w", err)
+		}
+		fmt.Println("• Engine: sing-box — establishing tunnel…")
+		return proxy.Run(ctx, proxy.RunOptions{
+			Binary:        bin,
+			Out:           &out,
+			Verbose:       flagVerbose,
+			OnReady:       onReady,
+			ReadyDeadline: readyDeadline,
+		})
+
 	default:
 		return "", fmt.Errorf("unknown protocol %q on server %s", s.Protocol, s.ID)
 	}
 }
 
-func runOpenVPN(ctx context.Context, s *backend.Server) (string, error) {
-	bin, err := openvpn.EnsureInstalled(ctx, !flagNoInstall)
-	if err != nil {
-		return "", err
-	}
-	fmt.Println("• Engine: openvpn — establishing tunnel (this can take 10-30s)…")
-	opts := openvpn.RunOptions{
-		Binary:        bin,
-		Config:        s.Config,
-		Verbose:       flagVerbose,
-		OnReady:       func() { fmt.Println("• Connected ✓ — Ctrl-C to disconnect") },
-		ReadyDeadline: readyDeadline,
-	}
-	if s.Credentials != nil {
-		opts.Credentials = &openvpn.Credentials{
-			Username: s.Credentials.Username,
-			Password: s.Credentials.Password,
-		}
-	}
-	return openvpn.Run(ctx, opts)
-}
-
-func runSingBox(ctx context.Context, s *backend.Server) (string, error) {
-	bin, err := proxy.EnsureSingBox(ctx)
-	if err != nil {
-		return "", fmt.Errorf("sing-box: %w", err)
-	}
-	var out proxy.Outbound
-	if err := json.Unmarshal(s.Config, &out); err != nil {
-		return "", fmt.Errorf("unmarshal outbound: %w", err)
-	}
-	fmt.Println("• Engine: sing-box — establishing tunnel…")
-	return proxy.Run(ctx, proxy.RunOptions{
-		Binary:        bin,
-		Out:           &out,
-		Verbose:       flagVerbose,
-		OnReady:       func() { fmt.Println("• Connected ✓ — Ctrl-C to disconnect") },
-		ReadyDeadline: readyDeadline,
-	})
-}
-
-// reportFailure prints a friendly diagnosis for a failed connection. If the
-// captured output matches a known pattern we attribute fault and suggest an
-// action; otherwise we hint at -v for raw logs.
+// reportFailure prints a friendly diagnosis for a failed engine. Called only
+// when the engine itself errored — probe-driven retries don't pass through.
 func reportFailure(s *backend.Server, output string, runErr error) {
 	fmt.Println()
 
-	// Timeout is its own thing — we killed the subprocess because the engine
-	// started but never confirmed connected. Almost always means the server
-	// is dead, not a tun0access issue.
 	if errors.Is(runErr, runtools.TimedOut) {
 		fmt.Printf("✗ This server never became ready (timed out after %s).\n", readyDeadline)
-		fmt.Println("  → The server is likely down or unreachable. Re-run to pick a different one.")
+		fmt.Println("  → The server is likely down or unreachable. Re-run to try a different one.")
 		if flagVerbose {
 			if hint := lastMeaningfulLine(output); hint != "" {
 				fmt.Println("  Last log line:", hint)
@@ -217,23 +322,21 @@ func reportFailure(s *backend.Server, output string, runErr error) {
 	fmt.Printf("%s %s — %s\n", icon, prefix, d.Summary)
 	fmt.Printf("  → %s\n", d.Action)
 
-	// For "ours" diagnoses (tun0access bugs) always surface the underlying
-	// line so reports back to us are immediately actionable. Server/user
-	// faults don't need this — the summary already tells the user what to do.
 	if d.Fault == diagnose.FaultOurs {
 		if hint := lastMeaningfulLine(output); hint != "" {
 			fmt.Println("  Underlying:", hint)
 		}
 	}
-
 	if flagVerbose {
 		fmt.Println("\n  Raw exit error:", runErr)
 	}
 }
 
+// ErrSilent — runConnect printed everything already; main() just exits 1.
+var ErrSilent = errors.New("silent")
+
 // lastMeaningfulLine returns the last non-empty output line, trimmed and
-// truncated, that isn't pure noise (timestamps, blank lines). It's the
-// "best guess" hint we offer when our pattern bank doesn't match.
+// truncated.
 func lastMeaningfulLine(output string) string {
 	lines := strings.Split(output, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
@@ -241,8 +344,6 @@ func lastMeaningfulLine(output string) string {
 		if s == "" {
 			continue
 		}
-		// Drop common log prefixes (timestamps, level brackets) to focus on
-		// the actual message.
 		if idx := strings.Index(s, "] "); idx >= 0 && idx < 40 {
 			s = strings.TrimSpace(s[idx+2:])
 		}
@@ -254,15 +355,24 @@ func lastMeaningfulLine(output string) string {
 	return ""
 }
 
-// pickServer chooses among the top 5 servers in a country at random so we
-// spread load and don't hammer a single endpoint.
-func pickServer(servers []backend.Server, cc string) *backend.Server {
+// pickServer chooses among the top 5 servers in a country at random,
+// skipping any that the caller has already attempted in this session.
+func pickServer(servers []backend.Server, cc string, exclude map[string]bool) *backend.Server {
 	grouped := backend.GroupByCountry(servers)
 	pool := grouped[cc]
 	if len(pool) == 0 {
 		return nil
 	}
-	top := pool
+	var available []backend.Server
+	for _, s := range pool {
+		if !exclude[s.ID] {
+			available = append(available, s)
+		}
+	}
+	if len(available) == 0 {
+		return nil
+	}
+	top := available
 	if len(top) > 5 {
 		top = top[:5]
 	}
