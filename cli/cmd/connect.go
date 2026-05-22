@@ -74,6 +74,13 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		cc = strings.ToUpper(args[0])
 	}
 
+	// Pre-resolve the bandwidth-probe target before any tunnel is up.
+	// Otherwise the post-connect probe's DNS lookup goes through the proxy
+	// and fails as "no such host" even on tunnels that work for raw TCP.
+	if !flagNoProbe {
+		speedtest.Prepare(ctx)
+	}
+
 	fmt.Println("• Fetching server list…")
 	servers, errs := backend.FetchAll(ctx)
 	for _, e := range errs {
@@ -194,7 +201,7 @@ func attemptConnect(parentCtx context.Context, s *backend.Server) (string, error
 			res, err := speedtest.Probe(runCtx)
 			probeRan.Store(true)
 			if err != nil {
-				fmt.Println("  ✗ Tunnel up but the test request failed:", err)
+				fmt.Printf("  ✗ Server isn't passing real traffic — %s. Trying another…\n", summariseProbeErr(err))
 				probeFailed.Store(true)
 				cancelRun()
 				return
@@ -334,6 +341,34 @@ func reportFailure(s *backend.Server, output string, runErr error) {
 
 // ErrSilent — runConnect printed everything already; main() just exits 1.
 var ErrSilent = errors.New("silent")
+
+// summariseProbeErr boils raw network errors down to a 5-word verdict for
+// the retry message. We don't need the full stack — just enough for the user
+// to know "tunnel is broken, not just slow".
+func summariseProbeErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "context deadline exceeded"), strings.Contains(s, "i/o timeout"):
+		return "request timed out"
+	case strings.Contains(s, "connection refused"):
+		return "connection refused"
+	case strings.Contains(s, "connection reset"):
+		return "connection reset"
+	case strings.Contains(s, "no such host"), strings.Contains(s, "lookup"):
+		return "DNS through tunnel broken"
+	case strings.Contains(s, "no route to host"), strings.Contains(s, "network is unreachable"):
+		return "no route to internet"
+	case strings.Contains(s, "truncated"):
+		return "connection dropped mid-transfer"
+	}
+	if len(s) > 80 {
+		s = s[:80] + "…"
+	}
+	return s
+}
 
 // lastMeaningfulLine returns the last non-empty output line, trimmed and
 // truncated.
