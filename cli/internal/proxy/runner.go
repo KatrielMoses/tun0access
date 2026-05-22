@@ -93,22 +93,36 @@ func buildConfig(out *Outbound) ([]byte, error) {
 		// tunnel is up. Raw output is hidden from the user unless --verbose,
 		// so the chattier log doesn't affect UX.
 		Log: map[string]any{"level": "info", "timestamp": true},
-		// sing-box 1.12+ DNS format: type/server fields instead of legacy address.
+		// DNS uses `local` (OS resolver) so queries do NOT traverse the proxy.
+		// Free SS/Trojan servers are slow → routing DNS through them produced
+		// 30s+ resolution times in practice and made "Connected ✓ but can't
+		// browse" the default user experience.
+		//
+		// `strategy: "ipv4_only"` stops the OS from offering AAAA records to
+		// apps. Without it, browsers Happy-Eyeball IPv6 first; free trojan
+		// servers almost never carry IPv6, so each request stalls 300-1000ms
+		// waiting for the IPv6 attempt to fail before falling back to v4.
 		DNS: map[string]any{
 			"servers": []any{
-				map[string]any{"tag": "remote", "type": "udp", "server": "1.1.1.1", "detour": "proxy"},
 				map[string]any{"tag": "local", "type": "local"},
 			},
-			"final": "remote",
+			"strategy": "ipv4_only",
+			"final":    "local",
 		},
 		// sing-box 1.11+ removed the inbound `sniff` field; sniffing is now a
-		// route rule action. Same for protocol-sniffing of DNS — moved to a
-		// `hijack-dns` action.
+		// route rule action. We also keep an IPv6 address on the TUN so any
+		// stray IPv6 traffic from apps still enters sing-box (where we reject
+		// it explicitly below) instead of leaking via the physical interface.
+		//
+		// mtu: 1380 leaves headroom for trojan/TLS encapsulation overhead;
+		// otherwise full-MTU packets get fragmented or silently dropped,
+		// which kills TLS handshakes long before throughput tests notice.
 		Inbounds: []any{
 			map[string]any{
 				"type":         "tun",
 				"tag":          "tun-in",
 				"address":      []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"},
+				"mtu":          1380,
 				"auto_route":   true,
 				"strict_route": true,
 				"stack":        "mixed",
@@ -119,15 +133,15 @@ func buildConfig(out *Outbound) ([]byte, error) {
 			map[string]any{"type": "direct", "tag": "direct"},
 		},
 		Route: map[string]any{
-			"auto_detect_interface": true,
-			"final":                 "proxy",
-			// default_domain_resolver was implicit before sing-box 1.12 and is
-			// now required. Resolve outbound hostnames via local DNS because
-			// the tunnel isn't up yet at outbound-dial time.
 			"default_domain_resolver": "local",
+			"auto_detect_interface":   true,
+			"final":                   "proxy",
 			"rules": []any{
 				map[string]any{"action": "sniff"},
 				map[string]any{"protocol": "dns", "action": "hijack-dns"},
+				// Reject IPv6 fast so Happy-Eyeballs apps fall back to v4 in
+				// <100ms instead of waiting for a tunnel-side timeout.
+				map[string]any{"ip_version": 6, "action": "reject"},
 				map[string]any{"ip_is_private": true, "action": "route", "outbound": "direct"},
 			},
 		},
