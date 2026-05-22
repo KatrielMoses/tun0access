@@ -90,6 +90,9 @@ func buildConfig(out *Outbound) ([]byte, error) {
 			},
 			"final": "remote",
 		},
+		// sing-box 1.11+ removed the inbound `sniff` field; sniffing is now a
+		// route rule action. Same for protocol-sniffing of DNS — moved to a
+		// `hijack-dns` action.
 		Inbounds: []any{
 			map[string]any{
 				"type":         "tun",
@@ -98,18 +101,18 @@ func buildConfig(out *Outbound) ([]byte, error) {
 				"auto_route":   true,
 				"strict_route": true,
 				"stack":        "mixed",
-				"sniff":        true,
 			},
 		},
 		Outbounds: []any{
 			outbound,
 			map[string]any{"type": "direct", "tag": "direct"},
-			map[string]any{"type": "block", "tag": "block"},
 		},
 		Route: map[string]any{
 			"auto_detect_interface": true,
 			"final":                 "proxy",
 			"rules": []any{
+				map[string]any{"action": "sniff"},
+				map[string]any{"protocol": "dns", "action": "hijack-dns"},
 				map[string]any{"ip_is_private": true, "outbound": "direct"},
 			},
 		},

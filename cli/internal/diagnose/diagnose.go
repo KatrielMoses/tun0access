@@ -110,7 +110,10 @@ var patterns = []pattern{
 
 	// ─── sing-box / proxy stack ────────────────────────────────────────
 	{
-		match: regexp.MustCompile(`ENABLE_DEPRECATED_LEGACY_DNS_SERVERS|legacy DNS servers is deprecated`),
+		// Catches every flavour of sing-box deprecation message — legacy DNS,
+		// legacy inbound/outbound fields, removed-in-X.Y, ENABLE_DEPRECATED_*,
+		// etc. They are always our fault (we shipped a stale config schema).
+		match: regexp.MustCompile(`(?i)ENABLE_DEPRECATED_|legacy .* (is |are )?deprecated|deprecated in sing-box .* and (will be )?removed|migrate-legacy`),
 		diag: Diagnosis{
 			Fault:   FaultOurs,
 			Summary: "tun0access generated a config using a deprecated sing-box format.",

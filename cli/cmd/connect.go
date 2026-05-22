@@ -166,12 +166,15 @@ func reportFailure(s *backend.Server, output string, runErr error) {
 	d := diagnose.Recognise(output)
 	if d == nil {
 		fmt.Println("✗ Connection failed (unrecognised error).")
-		fmt.Println("  Run again with -v to see the engine's raw output.")
-		if !flagVerbose {
-			fmt.Println("  Or try another country — free servers come and go.")
-		} else {
-			fmt.Println("  Underlying error:", runErr)
+		if hint := lastMeaningfulLine(output); hint != "" {
+			fmt.Println("  Hint:", hint)
 		}
+		if flagVerbose {
+			fmt.Println("  Raw exit error:", runErr)
+		} else {
+			fmt.Println("  Run again with -v for full engine output.")
+		}
+		fmt.Println("  Or try another country — free servers come and go.")
 		return
 	}
 
@@ -193,6 +196,29 @@ func reportFailure(s *backend.Server, output string, runErr error) {
 	if flagVerbose {
 		fmt.Println("\n  Raw exit error:", runErr)
 	}
+}
+
+// lastMeaningfulLine returns the last non-empty output line, trimmed and
+// truncated, that isn't pure noise (timestamps, blank lines). It's the
+// "best guess" hint we offer when our pattern bank doesn't match.
+func lastMeaningfulLine(output string) string {
+	lines := strings.Split(output, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		s := strings.TrimSpace(lines[i])
+		if s == "" {
+			continue
+		}
+		// Drop common log prefixes (timestamps, level brackets) to focus on
+		// the actual message.
+		if idx := strings.Index(s, "] "); idx >= 0 && idx < 40 {
+			s = strings.TrimSpace(s[idx+2:])
+		}
+		if len(s) > 220 {
+			s = s[:220] + "…"
+		}
+		return s
+	}
+	return ""
 }
 
 // pickServer chooses among the top 5 servers in a country at random so we
