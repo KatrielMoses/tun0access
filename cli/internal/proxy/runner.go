@@ -8,16 +8,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/KatrielMoses/tun0access/internal/runtools"
 )
 
 // RunOptions configures a sing-box session.
 type RunOptions struct {
-	Binary  string
-	Out     *Outbound
-	Verbose bool
-	OnReady func()
+	Binary        string
+	Out           *Outbound
+	Verbose       bool
+	OnReady       func()
+	ReadyDeadline time.Duration
 }
 
 // Run builds a sing-box config from the parsed Outbound, writes it to a temp
@@ -55,12 +57,17 @@ func Run(ctx context.Context, opts RunOptions) (string, error) {
 		}
 	}
 
-	cmd := exec.CommandContext(ctx, name, args...)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	cmd := exec.CommandContext(runCtx, name, args...)
 	return runtools.Run(ctx, runtools.Options{
-		Cmd:     cmd,
-		Verbose: opts.Verbose,
-		OnReady: opts.OnReady,
-		UserOut: os.Stderr,
+		Cmd:              cmd,
+		Verbose:          opts.Verbose,
+		OnReady:          opts.OnReady,
+		UserOut:           os.Stderr,
+		ReadyDeadline:    opts.ReadyDeadline,
+		CancelOnDeadline: cancel,
 	})
 }
 
@@ -81,7 +88,11 @@ func buildConfig(out *Outbound) ([]byte, error) {
 	}
 
 	cfg := singBoxConfig{
-		Log: map[string]any{"level": "warn", "timestamp": true},
+		// info-level is required: "sing-box started" — our success marker — is
+		// logged at INFO. At warn the line is suppressed and we never know the
+		// tunnel is up. Raw output is hidden from the user unless --verbose,
+		// so the chattier log doesn't affect UX.
+		Log: map[string]any{"level": "info", "timestamp": true},
 		// sing-box 1.12+ DNS format: type/server fields instead of legacy address.
 		DNS: map[string]any{
 			"servers": []any{

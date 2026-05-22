@@ -15,6 +15,7 @@ import (
 	"io"
 	"os/exec"
 	"sync"
+	"time"
 
 	"github.com/KatrielMoses/tun0access/internal/diagnose"
 )
@@ -25,7 +26,9 @@ const ringMaxBytes = 256 * 1024
 
 // Options configures a single Run call.
 type Options struct {
-	// Cmd is the already-configured but not-yet-started command.
+	// Cmd is the already-configured but not-yet-started command. Its context
+	// MUST be the one returned by ReadyContext (or a parent of it) so the
+	// deadline cancellation actually terminates the subprocess.
 	Cmd *exec.Cmd
 	// Verbose controls whether raw subprocess output is also streamed to
 	// UserOut. When false, the user only sees our own status messages.
@@ -35,7 +38,20 @@ type Options struct {
 	OnReady func()
 	// UserOut receives raw lines when Verbose is true. Typically os.Stderr.
 	UserOut io.Writer
+	// ReadyDeadline, if > 0, kills the subprocess when no success marker has
+	// been observed by this duration. Use to bound silent-hang failures.
+	ReadyDeadline time.Duration
+	// CancelOnDeadline is invoked when ReadyDeadline expires before the
+	// success marker fires. The caller's exec.CommandContext context must
+	// be wired to a Cancel that this triggers. Optional but strongly
+	// recommended when ReadyDeadline is set.
+	CancelOnDeadline func()
 }
+
+// TimedOut is returned (wrapped) when the subprocess was killed because the
+// ReadyDeadline expired. Callers should treat this as "engine started but
+// never confirmed connected" rather than a generic error.
+var TimedOut = fmt.Errorf("ready deadline exceeded")
 
 // Run starts Cmd, pumps its output, and blocks until it exits. The returned
 // string is the captured ring-buffer contents (combined stdout+stderr,
@@ -56,15 +72,41 @@ func Run(ctx context.Context, opts Options) (string, error) {
 		return "", err
 	}
 
+	readyCh := make(chan struct{}, 1)
 	var (
-		wg         sync.WaitGroup
-		readyOnce  sync.Once
-		fireReady  = func() {
-			if opts.OnReady != nil {
-				readyOnce.Do(opts.OnReady)
-			}
+		wg        sync.WaitGroup
+		readyOnce sync.Once
+		fireReady = func() {
+			readyOnce.Do(func() {
+				if opts.OnReady != nil {
+					opts.OnReady()
+				}
+				select {
+				case readyCh <- struct{}{}:
+				default:
+				}
+			})
 		}
 	)
+
+	// Deadline watchdog: if the success marker doesn't fire in time, cancel
+	// the subprocess context so cmd.Wait() returns and we can surface a
+	// "engine started but never connected" diagnosis.
+	var timedOut bool
+	var timedOutMu sync.Mutex
+	if opts.ReadyDeadline > 0 && opts.CancelOnDeadline != nil {
+		go func() {
+			select {
+			case <-readyCh:
+				// success — let the process keep running
+			case <-time.After(opts.ReadyDeadline):
+				timedOutMu.Lock()
+				timedOut = true
+				timedOutMu.Unlock()
+				opts.CancelOnDeadline()
+			}
+		}()
+	}
 
 	pump := func(r io.Reader) {
 		defer wg.Done()
@@ -87,6 +129,13 @@ func Run(ctx context.Context, opts Options) (string, error) {
 
 	waitErr := opts.Cmd.Wait()
 	wg.Wait()
+
+	timedOutMu.Lock()
+	hit := timedOut
+	timedOutMu.Unlock()
+	if hit {
+		return ring.String(), fmt.Errorf("%w (subprocess killed after timeout)", TimedOut)
+	}
 	return ring.String(), waitErr
 }
 

@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/KatrielMoses/tun0access/internal/runtools"
 )
@@ -19,11 +20,12 @@ type Credentials struct {
 
 // RunOptions bundles everything Run needs to start an openvpn session.
 type RunOptions struct {
-	Binary      string
-	Config      []byte
-	Credentials *Credentials
-	Verbose     bool
-	OnReady     func() // called once when "Initialization Sequence Completed" is seen
+	Binary        string
+	Config        []byte
+	Credentials   *Credentials
+	Verbose       bool
+	OnReady       func()        // called once when "Initialization Sequence Completed" is seen
+	ReadyDeadline time.Duration // kill openvpn if not ready within this window (0 = no limit)
 }
 
 // Run executes openvpn with the provided options. Returns the captured
@@ -69,11 +71,19 @@ func Run(ctx context.Context, opts RunOptions) (string, error) {
 		}
 	}
 
-	cmd := exec.CommandContext(ctx, name, args...)
+	// Derive a sub-context so the deadline watchdog can kill the subprocess
+	// without cancelling the caller's context (which would also abort
+	// Ctrl-C handling).
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	cmd := exec.CommandContext(runCtx, name, args...)
 	return runtools.Run(ctx, runtools.Options{
-		Cmd:     cmd,
-		Verbose: opts.Verbose,
-		OnReady: opts.OnReady,
-		UserOut: os.Stderr,
+		Cmd:              cmd,
+		Verbose:          opts.Verbose,
+		OnReady:          opts.OnReady,
+		UserOut:           os.Stderr,
+		ReadyDeadline:    opts.ReadyDeadline,
+		CancelOnDeadline: cancel,
 	})
 }

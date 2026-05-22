@@ -10,14 +10,21 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/KatrielMoses/tun0access/internal/backend"
 	"github.com/KatrielMoses/tun0access/internal/diagnose"
 	"github.com/KatrielMoses/tun0access/internal/openvpn"
 	"github.com/KatrielMoses/tun0access/internal/proxy"
+	"github.com/KatrielMoses/tun0access/internal/runtools"
 	"github.com/KatrielMoses/tun0access/internal/ui"
 	"github.com/spf13/cobra"
 )
+
+// readyDeadline bounds the "connecting…" phase. If neither engine reaches its
+// success marker in this time, we kill it and tell the user the server is
+// dead. Beats the previous behaviour of hanging silently for 15 minutes.
+const readyDeadline = 45 * time.Second
 
 var (
 	flagCountry   string
@@ -126,10 +133,11 @@ func runOpenVPN(ctx context.Context, s *backend.Server) (string, error) {
 	}
 	fmt.Println("• Engine: openvpn — establishing tunnel (this can take 10-30s)…")
 	opts := openvpn.RunOptions{
-		Binary:  bin,
-		Config:  s.Config,
-		Verbose: flagVerbose,
-		OnReady: func() { fmt.Println("• Connected ✓ — Ctrl-C to disconnect") },
+		Binary:        bin,
+		Config:        s.Config,
+		Verbose:       flagVerbose,
+		OnReady:       func() { fmt.Println("• Connected ✓ — Ctrl-C to disconnect") },
+		ReadyDeadline: readyDeadline,
 	}
 	if s.Credentials != nil {
 		opts.Credentials = &openvpn.Credentials{
@@ -151,10 +159,11 @@ func runSingBox(ctx context.Context, s *backend.Server) (string, error) {
 	}
 	fmt.Println("• Engine: sing-box — establishing tunnel…")
 	return proxy.Run(ctx, proxy.RunOptions{
-		Binary:  bin,
-		Out:     &out,
-		Verbose: flagVerbose,
-		OnReady: func() { fmt.Println("• Connected ✓ — Ctrl-C to disconnect") },
+		Binary:        bin,
+		Out:           &out,
+		Verbose:       flagVerbose,
+		OnReady:       func() { fmt.Println("• Connected ✓ — Ctrl-C to disconnect") },
+		ReadyDeadline: readyDeadline,
 	})
 }
 
@@ -163,6 +172,21 @@ func runSingBox(ctx context.Context, s *backend.Server) (string, error) {
 // action; otherwise we hint at -v for raw logs.
 func reportFailure(s *backend.Server, output string, runErr error) {
 	fmt.Println()
+
+	// Timeout is its own thing — we killed the subprocess because the engine
+	// started but never confirmed connected. Almost always means the server
+	// is dead, not a tun0access issue.
+	if errors.Is(runErr, runtools.TimedOut) {
+		fmt.Printf("✗ This server never became ready (timed out after %s).\n", readyDeadline)
+		fmt.Println("  → The server is likely down or unreachable. Re-run to pick a different one.")
+		if flagVerbose {
+			if hint := lastMeaningfulLine(output); hint != "" {
+				fmt.Println("  Last log line:", hint)
+			}
+		}
+		return
+	}
+
 	d := diagnose.Recognise(output)
 	if d == nil {
 		fmt.Println("✗ Connection failed (unrecognised error).")
