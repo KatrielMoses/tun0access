@@ -249,9 +249,9 @@ func buildRiseupConfig(ip, host, port, proto string, ca, cert, key []byte, opts 
 		}
 	}
 
-	fmt.Fprintf(&b, "<ca>\n%s</ca>\n", strings.TrimSpace(string(ca)))
-	fmt.Fprintf(&b, "<cert>\n%s</cert>\n", strings.TrimSpace(string(cert)))
-	fmt.Fprintf(&b, "<key>\n%s</key>\n", strings.TrimSpace(string(key)))
+	fmt.Fprintf(&b, "<ca>\n%s\n</ca>\n", strings.TrimSpace(string(ca)))
+	fmt.Fprintf(&b, "<cert>\n%s\n</cert>\n", strings.TrimSpace(string(cert)))
+	fmt.Fprintf(&b, "<key>\n%s\n</key>\n", strings.TrimSpace(string(key)))
 	return []byte(b.String())
 }
 

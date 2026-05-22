@@ -43,7 +43,13 @@ func Run(ctx context.Context, opts RunOptions) error {
 		return fmt.Errorf("write config: %w", err)
 	}
 
-	args := []string{"--config", cfgPath, "--verb", "3"}
+	// data-ciphers fallback covers legacy VPN Gate servers that still
+	// advertise AES-128-CBC, which OpenVPN 2.6+ dropped from the default set.
+	args := []string{
+		"--config", cfgPath,
+		"--verb", "3",
+		"--data-ciphers", "AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC:CHACHA20-POLY1305",
+	}
 
 	if opts.Credentials != nil {
 		authPath := filepath.Join(dir, "auth.txt")
