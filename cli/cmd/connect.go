@@ -139,16 +139,26 @@ func runConnect(cmd *cobra.Command, args []string) error {
 			// or the engine died after a healthy probe. Treat as done.
 			return nil
 		case verdictSlow:
-			lastReason = fmt.Sprintf("server too slow (~%.2f Mbps)", lastMbps.Load()/100)
+			lastReason = fmt.Sprintf("server too slow (~%.2f Mbps)", float64(lastMbps.Load())/100)
 			continue
 		case verdictUnreachable:
 			lastReason = "tunnel up but couldn't reach the internet"
 			continue
 		case verdictEngineFailed:
-			// Engine itself blew up — bad config, bad creds, dead handshake.
-			// Don't retry; show the diagnosis and bail.
-			reportFailure(chosen, output, runErr)
-			return ErrSilent
+			// Engine blew up before we could probe. Most common cause is a
+			// server-specific config quirk that our parser didn't catch (new
+			// cipher, new flow, etc). Retry with the next server unless the
+			// diagnosis says it's our bug or needs user action.
+			d := diagnose.Recognise(output)
+			if d != nil && (d.Fault == diagnose.FaultOurs || d.Fault == diagnose.FaultUser) {
+				reportFailure(chosen, output, runErr)
+				return ErrSilent
+			}
+			lastReason = "engine refused this server's config"
+			if hint := lastMeaningfulLine(output); hint != "" {
+				lastReason = hint
+			}
+			continue
 		}
 	}
 

@@ -81,6 +81,11 @@ type singBoxConfig struct {
 	Route     map[string]any `json:"route"`
 }
 
+// BuildConfigForValidate is exported only so the `tun0access validate`
+// command can run sing-box check against the same config the runner would
+// generate. Not part of the public API; do not call from outside cmd/.
+func BuildConfigForValidate(out *Outbound) ([]byte, error) { return buildConfig(out) }
+
 func buildConfig(out *Outbound) ([]byte, error) {
 	outbound, err := outboundConfig(out)
 	if err != nil {

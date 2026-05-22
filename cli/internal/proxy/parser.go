@@ -193,12 +193,23 @@ func parseVLESS(uri string) (*Outbound, error) {
 		return nil, fmt.Errorf("vless: missing uuid/host/port")
 	}
 	q := u.Query()
+	// sing-box only implements the canonical `xtls-rprx-vision` flow.
+	// Variants like `xtls-rprx-vision-udp443` (Xray-only UDP-443 forwarding)
+	// cause "unsupported flow" at config-init time. Reject them at parse so
+	// they never enter the candidate pool.
+	flow := q.Get("flow")
+	switch flow {
+	case "", "xtls-rprx-vision":
+		// supported
+	default:
+		return nil, fmt.Errorf("vless: unsupported flow %q", flow)
+	}
 	o := &Outbound{
 		Protocol: "vless", Tag: u.Fragment,
 		Server: host, ServerPort: port, UUID: uuid,
 		Network: firstNonEmpty(q.Get("type"), "tcp"),
 		WSPath:  q.Get("path"), WSHost: q.Get("host"),
-		Flow: q.Get("flow"), SNI: q.Get("sni"),
+		Flow: flow, SNI: q.Get("sni"),
 		TLS: q.Get("security") == "tls" || q.Get("security") == "reality",
 		GRPCServiceName: q.Get("serviceName"),
 		SkipCertVerify:  true,
