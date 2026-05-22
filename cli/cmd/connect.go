@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -8,24 +10,26 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/spf13/cobra"
 	"github.com/KatrielMoses/tun0access/internal/backend"
 	"github.com/KatrielMoses/tun0access/internal/openvpn"
+	"github.com/KatrielMoses/tun0access/internal/proxy"
 	"github.com/KatrielMoses/tun0access/internal/ui"
+	"github.com/spf13/cobra"
 )
 
 var (
-	flagCountry  string
-	flagBackend  string
+	flagCountry   string
+	flagBackend   string
 	flagNoInstall bool
 )
 
 var connectCmd = &cobra.Command{
 	Use:   "connect [country-code]",
-	Short: "Connect to a free VPN server (optionally pinned to a country)",
+	Short: "Connect to a free VPN / proxy server (optionally pinned to a country)",
 	Long: `Fetches the current server list from every enabled backend, lets you pick
-a country, then hands the selected server's config to openvpn. The process
-runs in the foreground — Ctrl-C disconnects.
+a country, then dispatches to the right engine (openvpn for VPN protocols,
+sing-box for shadowsocks / vmess / vless / trojan). Foreground process —
+Ctrl-C disconnects.
 
   tun0access connect          # interactive picker
   tun0access connect JP       # connect to Japan, pick best server`,
@@ -35,8 +39,8 @@ runs in the foreground — Ctrl-C disconnects.
 
 func init() {
 	connectCmd.Flags().StringVar(&flagCountry, "country", "", "ISO-3166 alpha-2 country code (e.g. JP, US)")
-	connectCmd.Flags().StringVar(&flagBackend, "backend", "", "restrict to a single backend (e.g. vpngate)")
-	connectCmd.Flags().BoolVar(&flagNoInstall, "no-install", false, "do not attempt to auto-install openvpn if missing")
+	connectCmd.Flags().StringVar(&flagBackend, "backend", "", "restrict to a single backend (e.g. vpngate, riseup, ss-aggregator)")
+	connectCmd.Flags().BoolVar(&flagNoInstall, "no-install", false, "do not auto-install openvpn or sing-box if missing")
 }
 
 func runConnect(cmd *cobra.Command, args []string) error {
@@ -47,13 +51,6 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	if cc == "" && len(args) == 1 {
 		cc = strings.ToUpper(args[0])
 	}
-
-	fmt.Println("• Checking for openvpn…")
-	bin, err := openvpn.EnsureInstalled(ctx, !flagNoInstall)
-	if err != nil {
-		return err
-	}
-	fmt.Println("  found:", bin)
 
 	fmt.Println("• Fetching server list…")
 	servers, errs := backend.FetchAll(ctx)
@@ -85,22 +82,52 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	if chosen == nil {
 		return fmt.Errorf("no servers available for country %q", cc)
 	}
-	fmt.Printf("• Connecting via %s (%s) — backend=%s, score=%d, ping=%dms\n",
-		chosen.CountryLong, chosen.CountryShort, chosen.Backend, chosen.Score, chosen.PingMS)
+	fmt.Printf("• Connecting via %s (%s) — backend=%s, protocol=%s, score=%d\n",
+		chosen.CountryLong, chosen.CountryShort, chosen.Backend, chosen.Protocol, chosen.Score)
 	fmt.Println("  Ctrl-C to disconnect.")
 	fmt.Println()
 
-	opts := openvpn.RunOptions{
-		Binary: bin,
-		Config: chosen.Config,
+	switch chosen.Protocol {
+	case "openvpn":
+		return runOpenVPN(ctx, chosen)
+	case "shadowsocks", "vmess", "vless", "trojan":
+		return runSingBox(ctx, chosen)
+	default:
+		return fmt.Errorf("unknown protocol %q on server %s", chosen.Protocol, chosen.ID)
 	}
-	if chosen.Credentials != nil {
+}
+
+func runOpenVPN(ctx context.Context, s *backend.Server) error {
+	fmt.Println("• Checking for openvpn…")
+	bin, err := openvpn.EnsureInstalled(ctx, !flagNoInstall)
+	if err != nil {
+		return err
+	}
+	fmt.Println("  found:", bin)
+
+	opts := openvpn.RunOptions{Binary: bin, Config: s.Config}
+	if s.Credentials != nil {
 		opts.Credentials = &openvpn.Credentials{
-			Username: chosen.Credentials.Username,
-			Password: chosen.Credentials.Password,
+			Username: s.Credentials.Username,
+			Password: s.Credentials.Password,
 		}
 	}
 	return openvpn.Run(ctx, opts)
+}
+
+func runSingBox(ctx context.Context, s *backend.Server) error {
+	fmt.Println("• Preparing sing-box…")
+	bin, err := proxy.EnsureSingBox(ctx)
+	if err != nil {
+		return fmt.Errorf("sing-box: %w", err)
+	}
+	fmt.Println("  found:", bin)
+
+	var out proxy.Outbound
+	if err := json.Unmarshal(s.Config, &out); err != nil {
+		return fmt.Errorf("unmarshal outbound: %w", err)
+	}
+	return proxy.Run(ctx, bin, &out)
 }
 
 // pickServer chooses among the top 5 servers in a country at random so we
@@ -138,4 +165,3 @@ func countCountries(servers []backend.Server) int {
 	}
 	return len(seen)
 }
-
