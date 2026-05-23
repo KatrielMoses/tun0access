@@ -14,10 +14,10 @@ import (
 )
 
 // Outbound is the protocol-agnostic representation of a single proxy server.
-// The fields it carries are the union of what ss/vmess/vless/trojan need; the
-// sing-box config generator picks the relevant subset per protocol.
+// The fields it carries are the union of what every supported protocol
+// needs; the sing-box config generator picks the relevant subset.
 type Outbound struct {
-	Protocol string // "shadowsocks" | "vmess" | "vless" | "trojan"
+	Protocol string // "shadowsocks" | "vmess" | "vless" | "trojan" | "tuic" | "hysteria2"
 	Tag      string // human label from the URI fragment
 
 	// Common
@@ -41,6 +41,14 @@ type Outbound struct {
 	SNI             string
 	ALPN            []string
 	SkipCertVerify  bool
+
+	// TUIC v5
+	CongestionControl string // "bbr" | "cubic" | "new_reno"
+	UDPRelayMode      string // "native" | "quic"
+
+	// Hysteria 2
+	ObfsType     string // typically "salamander"
+	ObfsPassword string
 }
 
 // Parse picks the right scheme parser. Returns an error for unsupported
@@ -56,6 +64,15 @@ func Parse(uri string) (*Outbound, error) {
 		return parseVLESS(uri)
 	case strings.HasPrefix(uri, "trojan://"):
 		return parseTrojan(uri)
+	case strings.HasPrefix(uri, "tuic://"):
+		return parseTUIC(uri)
+	case strings.HasPrefix(uri, "hysteria2://"), strings.HasPrefix(uri, "hy2://"):
+		return parseHysteria2(uri)
+	case strings.HasPrefix(uri, "hysteria://"):
+		// Hysteria v1 uses a fundamentally different config shape (separate
+		// up/down bandwidth mandated, no user@host userinfo); not worth a
+		// full parser for a mostly-deprecated protocol.
+		return nil, fmt.Errorf("hysteria v1 unsupported (use hysteria2)")
 	}
 	return nil, fmt.Errorf("unsupported scheme: %q", firstChars(uri, 12))
 }
@@ -213,6 +230,72 @@ func parseVLESS(uri string) (*Outbound, error) {
 		TLS: q.Get("security") == "tls" || q.Get("security") == "reality",
 		GRPCServiceName: q.Get("serviceName"),
 		SkipCertVerify:  true,
+	}
+	if alpn := q.Get("alpn"); alpn != "" {
+		o.ALPN = strings.Split(alpn, ",")
+	}
+	return o, nil
+}
+
+// parseTUIC: tuic://<uuid>:<password>@<host>:<port>?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=...&allow_insecure=1#<tag>
+//
+// The userinfo is always uuid:password (TUIC v5 — no other versions are in
+// the free-config wild). We default to bbr / native because that's what
+// every observed config uses and what sing-box assumes when unset.
+func parseTUIC(uri string) (*Outbound, error) {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("tuic parse: %w", err)
+	}
+	uuid := u.User.Username()
+	pwd, _ := u.User.Password()
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	if uuid == "" || host == "" || port == 0 {
+		return nil, fmt.Errorf("tuic: missing uuid/host/port")
+	}
+	q := u.Query()
+	allowInsecure := q.Get("allow_insecure") == "1" || q.Get("allowInsecure") == "1" || q.Get("insecure") == "1"
+	o := &Outbound{
+		Protocol:          "tuic", Tag: u.Fragment,
+		Server:            host, ServerPort: port,
+		UUID:              uuid, Password: pwd,
+		CongestionControl: firstNonEmpty(q.Get("congestion_control"), "bbr"),
+		UDPRelayMode:      firstNonEmpty(q.Get("udp_relay_mode"), "native"),
+		TLS:               true, // TUIC is always TLS (QUIC handshake)
+		SNI:               q.Get("sni"),
+		SkipCertVerify:    allowInsecure,
+	}
+	if alpn := q.Get("alpn"); alpn != "" {
+		o.ALPN = strings.Split(alpn, ",")
+	}
+	return o, nil
+}
+
+// parseHysteria2: hysteria2://<password>@<host>:<port>?sni=...&insecure=0&alpn=h3&obfs=salamander&obfs-password=...#<tag>
+// Accepts hy2:// as a common alias.
+func parseHysteria2(uri string) (*Outbound, error) {
+	uri = strings.Replace(uri, "hy2://", "hysteria2://", 1)
+	u, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("hysteria2 parse: %w", err)
+	}
+	pwd := u.User.Username()
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	if pwd == "" || host == "" || port == 0 {
+		return nil, fmt.Errorf("hysteria2: missing password/host/port")
+	}
+	q := u.Query()
+	o := &Outbound{
+		Protocol:       "hysteria2", Tag: u.Fragment,
+		Server:         host, ServerPort: port,
+		Password:       pwd,
+		TLS:            true, // hysteria2 is always TLS (QUIC handshake)
+		SNI:            q.Get("sni"),
+		SkipCertVerify: q.Get("insecure") == "1",
+		ObfsType:       q.Get("obfs"),
+		ObfsPassword:   firstNonEmpty(q.Get("obfs-password"), q.Get("obfs_password")),
 	}
 	if alpn := q.Get("alpn"); alpn != "" {
 		o.ALPN = strings.Split(alpn, ",")

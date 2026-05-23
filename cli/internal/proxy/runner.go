@@ -203,6 +203,20 @@ func outboundConfig(o *Outbound) (map[string]any, error) {
 		} else {
 			base["tls"] = map[string]any{"enabled": true, "insecure": true}
 		}
+	case "tuic":
+		base["type"] = "tuic"
+		base["uuid"] = o.UUID
+		base["password"] = o.Password
+		base["congestion_control"] = o.CongestionControl
+		base["udp_relay_mode"] = o.UDPRelayMode
+		base["tls"] = tlsOrDefault(o, []string{"h3"})
+	case "hysteria2":
+		base["type"] = "hysteria2"
+		base["password"] = o.Password
+		if o.ObfsType != "" {
+			base["obfs"] = map[string]any{"type": o.ObfsType, "password": o.ObfsPassword}
+		}
+		base["tls"] = tlsOrDefault(o, []string{"h3"})
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", o.Protocol)
 	}
@@ -234,6 +248,26 @@ func buildTransport(o *Outbound) map[string]any {
 	default:
 		return nil
 	}
+}
+
+// tlsOrDefault returns buildTLS(o) when the URI advertised TLS, or a
+// permissive default TLS block with the given ALPN. Used by protocols where
+// TLS is mandatory (TUIC, Hysteria2 — both ride QUIC).
+func tlsOrDefault(o *Outbound, defaultALPN []string) map[string]any {
+	if t := buildTLS(o); t != nil {
+		if _, hasALPN := t["alpn"]; !hasALPN && len(defaultALPN) > 0 {
+			t["alpn"] = defaultALPN
+		}
+		return t
+	}
+	t := map[string]any{"enabled": true, "insecure": o.SkipCertVerify}
+	if o.SNI != "" {
+		t["server_name"] = o.SNI
+	}
+	if len(defaultALPN) > 0 {
+		t["alpn"] = defaultALPN
+	}
+	return t
 }
 
 func buildTLS(o *Outbound) map[string]any {

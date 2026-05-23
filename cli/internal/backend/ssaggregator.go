@@ -35,12 +35,21 @@ type SSAggregator struct {
 // expected to either be plain newline-separated URIs or a single base64 blob
 // that decodes to the same.
 var sources = []string{
+	// existing
 	"https://raw.githubusercontent.com/freefq/free/master/v2",
 	"https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
 	"https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub",
 	"https://raw.githubusercontent.com/learnhard-cn/free_proxy_ss/main/free",
 	"https://raw.githubusercontent.com/mfuu/v2ray/master/v2ray",
 	"https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt",
+
+	// added v0.4.5 — keep these under ~5k total URIs so GeoIP stays healthy.
+	// ebrasha's `all_extracted_configs.txt` (18.7 MB) was tried and yields
+	// ~24k URIs — overwhelms the GeoIP DNS pre-step. Revisit once GeoIP can
+	// handle that volume.
+	"https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/v2ray/all_sub.txt",
+	"https://raw.githubusercontent.com/AmirDVL/telegram-configs-collector/main/protocols/tuic",
+	"https://raw.githubusercontent.com/AmirDVL/telegram-configs-collector/main/protocols/hysteria",
 }
 
 func NewSSAggregator() *SSAggregator {
@@ -173,7 +182,10 @@ func (a *SSAggregator) fetchSource(ctx context.Context, url string) ([]string, e
 	if !strings.HasPrefix(preview, "ss://") &&
 		!strings.HasPrefix(preview, "vmess://") &&
 		!strings.HasPrefix(preview, "vless://") &&
-		!strings.HasPrefix(preview, "trojan://") {
+		!strings.HasPrefix(preview, "trojan://") &&
+		!strings.HasPrefix(preview, "tuic://") &&
+		!strings.HasPrefix(preview, "hysteria2://") &&
+		!strings.HasPrefix(preview, "hy2://") {
 		if dec, err := decodeAny(preview); err == nil {
 			body = []byte(dec)
 		}
@@ -190,7 +202,10 @@ func (a *SSAggregator) fetchSource(ctx context.Context, url string) ([]string, e
 		if strings.HasPrefix(line, "ss://") ||
 			strings.HasPrefix(line, "vmess://") ||
 			strings.HasPrefix(line, "vless://") ||
-			strings.HasPrefix(line, "trojan://") {
+			strings.HasPrefix(line, "trojan://") ||
+			strings.HasPrefix(line, "tuic://") ||
+			strings.HasPrefix(line, "hysteria2://") ||
+			strings.HasPrefix(line, "hy2://") {
 			uris = append(uris, line)
 		}
 	}

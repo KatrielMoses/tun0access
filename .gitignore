@@ -3,3 +3,9 @@ cli/tun0access.exe
 dist/
 ok
 skills-lock.json
+
+# Local-only research notes (model outputs, sketches, etc.)
+research/
+
+# Local-only dev planning / scratch
+DEV/

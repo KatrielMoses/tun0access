@@ -26,7 +26,9 @@ var validateCmd = &cobra.Command{
 	Hidden: true,
 	Short:  "Generate the sing-box config for every server and validate it locally",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx, cancel := context.WithTimeout(cmd.Context(), 90*time.Second)
+		// 8 min ceiling — sing-box check on Windows is ~100ms per invocation,
+		// so 2000+ servers comfortably fit.
+		ctx, cancel := context.WithTimeout(cmd.Context(), 8*time.Minute)
 		defer cancel()
 
 		bin, err := proxy.EnsureSingBox(ctx)
@@ -49,7 +51,7 @@ var validateCmd = &cobra.Command{
 
 		for i, s := range servers {
 			switch s.Protocol {
-			case "shadowsocks", "vmess", "vless", "trojan":
+			case "shadowsocks", "vmess", "vless", "trojan", "tuic", "hysteria2":
 			default:
 				continue
 			}

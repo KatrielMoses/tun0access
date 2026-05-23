@@ -1,8 +1,11 @@
 // Package geoip resolves server IPs/hostnames to ISO country codes.
 //
 // We use ip-api.com's batch endpoint — free, no key required, 100 IPs per
-// POST, rate-limit ~15 req/min for the free tier. With batching this handles
-// thousands of servers in seconds.
+// POST, ~14 batches/min on the free tier. The batch endpoint only accepts
+// IPs (it returns status:fail for hostnames), so we DNS-resolve hostnames
+// first. To make that scale, the resolution is done concurrently with a
+// worker pool. Results are cached in-memory AND on disk so subsequent CLI
+// invocations within ~24h reuse the lookup.
 package geoip
 
 import (
@@ -13,15 +16,21 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	apiURL      = "http://ip-api.com/batch?fields=status,country,countryCode,query"
-	batchSize   = 100
-	httpTimeout = 15 * time.Second
+	apiURL          = "http://ip-api.com/batch?fields=status,country,countryCode,query"
+	batchSize       = 100
+	httpTimeout     = 15 * time.Second
+	dnsTimeout      = 3 * time.Second
+	dnsConcurrency  = 50
+	diskCacheMaxAge = 24 * time.Hour
 )
 
 // Result is what we cache per host.
@@ -35,71 +44,115 @@ type Resolver struct {
 	HTTP *http.Client
 
 	mu    sync.RWMutex
-	cache map[string]Result
+	cache map[string]Result // key: original host string
 }
 
+// New constructs a Resolver and warms the in-memory cache from disk.
 func New() *Resolver {
-	return &Resolver{
+	r := &Resolver{
 		HTTP:  &http.Client{Timeout: httpTimeout},
 		cache: map[string]Result{},
 	}
+	r.loadFromDisk()
+	return r
 }
 
-// ResolveMany looks up an arbitrary list of hosts (hostnames or IPs). It
-// returns a map keyed by the original host string. Hostnames are resolved to
-// an A record first; lookups that fail return an empty Result rather than an
-// error so the caller can decide whether to skip those servers.
+// ResolveMany looks up an arbitrary list of hosts. The returned map is keyed
+// by the original host string. Hostnames are DNS-resolved in parallel; IPs
+// are queried via ip-api.com in batches of 100. Cache hits short-circuit
+// everything. Persists the cache to disk on completion.
 func (r *Resolver) ResolveMany(ctx context.Context, hosts []string) map[string]Result {
 	out := map[string]Result{}
 
-	// First pass: pull from cache, normalize hostnames → IPs.
-	var toQuery []string
-	hostToIP := map[string]string{}
+	// 1. Cache lookup.
+	var notCached []string
 	for _, h := range hosts {
-		ip := toIP(h)
-		hostToIP[h] = ip
-		if ip == "" {
-			out[h] = Result{}
+		if h == "" {
 			continue
 		}
 		r.mu.RLock()
-		c, ok := r.cache[ip]
+		c, ok := r.cache[h]
 		r.mu.RUnlock()
 		if ok {
 			out[h] = c
 			continue
 		}
-		toQuery = append(toQuery, ip)
+		notCached = append(notCached, h)
 	}
-	toQuery = dedup(toQuery)
+	notCached = dedup(notCached)
+	if len(notCached) == 0 {
+		return out
+	}
 
-	// Second pass: batch what's left.
-	for i := 0; i < len(toQuery); i += batchSize {
+	// 2. Concurrent DNS: hostname → IP. IPs pass through unchanged.
+	hostToIP := resolveHostsParallel(ctx, notCached, dnsConcurrency)
+
+	// 3. Collect unique IPs needing API lookup.
+	ipSet := map[string]struct{}{}
+	for _, ip := range hostToIP {
+		if ip != "" {
+			ipSet[ip] = struct{}{}
+		}
+	}
+	ipsToQuery := make([]string, 0, len(ipSet))
+	for ip := range ipSet {
+		ipsToQuery = append(ipsToQuery, ip)
+	}
+
+	// 4. Batch ip-api.com lookups. On 429 the loop just keeps going — those
+	// IPs will be missing from ipToResult and the hosts get empty results
+	// (still better than blocking).
+	ipToResult := map[string]Result{}
+	for i := 0; i < len(ipsToQuery); i += batchSize {
 		end := i + batchSize
-		if end > len(toQuery) {
-			end = len(toQuery)
+		if end > len(ipsToQuery) {
+			end = len(ipsToQuery)
 		}
-		results, err := r.batch(ctx, toQuery[i:end])
+		results, err := r.batch(ctx, ipsToQuery[i:end])
 		if err != nil {
-			continue // best-effort; let those hosts return empty
-		}
-		r.mu.Lock()
-		for ip, res := range results {
-			r.cache[ip] = res
-		}
-		r.mu.Unlock()
-	}
-
-	// Third pass: fill in remaining results from the now-warmed cache.
-	for h, ip := range hostToIP {
-		if _, ok := out[h]; ok {
 			continue
 		}
-		r.mu.RLock()
-		out[h] = r.cache[ip]
-		r.mu.RUnlock()
+		for ip, res := range results {
+			ipToResult[ip] = res
+		}
 	}
+
+	// 5. Fill output, populate cache.
+	r.mu.Lock()
+	for h, ip := range hostToIP {
+		var res Result
+		if ip != "" {
+			res = ipToResult[ip]
+		}
+		out[h] = res
+		r.cache[h] = res
+	}
+	r.mu.Unlock()
+
+	// 6. Persist (best-effort).
+	r.saveToDisk()
 	return out
+}
+
+func resolveHostsParallel(ctx context.Context, hosts []string, workers int) map[string]string {
+	result := make(map[string]string, len(hosts))
+	var mu sync.Mutex
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for _, h := range hosts {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(host string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			ip := toIP(ctx, host)
+			mu.Lock()
+			result[host] = ip
+			mu.Unlock()
+		}(h)
+	}
+	wg.Wait()
+	return result
 }
 
 type batchEntry struct {
@@ -147,17 +200,15 @@ func (r *Resolver) batch(ctx context.Context, ips []string) (map[string]Result, 
 }
 
 // toIP returns the dotted IPv4 form for a host. If the input is already an
-// IP, it is returned as-is. If it's a hostname, a DNS lookup is performed
-// (with a short timeout) and the first A record is returned. Returns "" on
-// failure.
-func toIP(host string) string {
+// IP, it is returned as-is. Hostname lookups have a short timeout so a
+// hung resolver doesn't stall the batch.
+func toIP(parent context.Context, host string) string {
 	if ip := net.ParseIP(host); ip != nil {
 		return ip.String()
 	}
-	resolver := &net.Resolver{}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(parent, dnsTimeout)
 	defer cancel()
-	ips, err := resolver.LookupIP(ctx, "ip4", host)
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
 	if err != nil || len(ips) == 0 {
 		return ""
 	}
@@ -175,4 +226,78 @@ func dedup(in []string) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// ── disk persistence ────────────────────────────────────────────────────
+
+type diskCache struct {
+	SavedAt time.Time         `json:"saved_at"`
+	Entries map[string]Result `json:"entries"`
+}
+
+func cacheFile() string {
+	switch runtime.GOOS {
+	case "windows":
+		if d := os.Getenv("LOCALAPPDATA"); d != "" {
+			return filepath.Join(d, "tun0access", "cache", "geoip.json")
+		}
+	case "darwin":
+		if d, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(d, "Library", "Caches", "tun0access", "geoip.json")
+		}
+	default:
+		if d, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(d, ".cache", "tun0access", "geoip.json")
+		}
+	}
+	return ""
+}
+
+func (r *Resolver) loadFromDisk() {
+	path := cacheFile()
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var dc diskCache
+	if err := json.Unmarshal(data, &dc); err != nil {
+		return
+	}
+	if time.Since(dc.SavedAt) > diskCacheMaxAge {
+		return
+	}
+	r.mu.Lock()
+	for k, v := range dc.Entries {
+		r.cache[k] = v
+	}
+	r.mu.Unlock()
+}
+
+func (r *Resolver) saveToDisk() {
+	path := cacheFile()
+	if path == "" {
+		return
+	}
+	r.mu.RLock()
+	// Only persist successful lookups. Empty Results stay in-memory (so the
+	// current process doesn't re-query within a single CLI invocation) but
+	// don't pollute future runs — important when a transient rate-limit
+	// briefly causes everything to look unresolvable.
+	snapshot := make(map[string]Result, len(r.cache))
+	for k, v := range r.cache {
+		if v.CountryCode == "" {
+			continue
+		}
+		snapshot[k] = v
+	}
+	r.mu.RUnlock()
+	data, err := json.Marshal(diskCache{SavedAt: time.Now(), Entries: snapshot})
+	if err != nil {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	_ = os.WriteFile(path, data, 0o600)
 }
