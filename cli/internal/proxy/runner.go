@@ -72,11 +72,14 @@ func Run(ctx context.Context, opts RunOptions) (string, error) {
 }
 
 // singBoxConfig is a partial sing-box v1.x JSON config — only the fields we
-// actually populate.
+// actually populate. `endpoints` is a top-level array introduced in 1.13
+// for protocols whose dialer also creates a network interface (currently
+// only WireGuard).
 type singBoxConfig struct {
 	Log       map[string]any `json:"log"`
 	DNS       map[string]any `json:"dns"`
 	Inbounds  []any          `json:"inbounds"`
+	Endpoints []any          `json:"endpoints,omitempty"`
 	Outbounds []any          `json:"outbounds"`
 	Route     map[string]any `json:"route"`
 }
@@ -87,6 +90,13 @@ type singBoxConfig struct {
 func BuildConfigForValidate(out *Outbound) ([]byte, error) { return buildConfig(out) }
 
 func buildConfig(out *Outbound) ([]byte, error) {
+	// WireGuard lives in `endpoints[]`, not `outbounds[]`, in sing-box 1.13+.
+	// We build it differently and keep `outbounds[]` minimal — just `direct`
+	// so private-IP routes still work.
+	if out.Protocol == "wireguard" {
+		return buildWireGuardConfig(out)
+	}
+
 	outbound, err := outboundConfig(out)
 	if err != nil {
 		return nil, err
@@ -146,6 +156,79 @@ func buildConfig(out *Outbound) ([]byte, error) {
 				map[string]any{"protocol": "dns", "action": "hijack-dns"},
 				// Reject IPv6 fast so Happy-Eyeballs apps fall back to v4 in
 				// <100ms instead of waiting for a tunnel-side timeout.
+				map[string]any{"ip_version": 6, "action": "reject"},
+				map[string]any{"ip_is_private": true, "action": "route", "outbound": "direct"},
+			},
+		},
+	}
+	return json.MarshalIndent(cfg, "", "  ")
+}
+
+// buildWireGuardConfig generates a sing-box config where the proxy lives in
+// `endpoints[]` (the new sing-box 1.13 home for WireGuard) and DNS / route
+// point at that endpoint's tag. Used by the WARP backend.
+func buildWireGuardConfig(o *Outbound) ([]byte, error) {
+	if o.PrivateKey == "" || o.PeerPublicKey == "" || o.PeerEndpoint == "" || o.PeerPort == 0 {
+		return nil, fmt.Errorf("wireguard: missing key/peer info")
+	}
+	mtu := o.MTU
+	if mtu == 0 {
+		mtu = 1280
+	}
+	peer := map[string]any{
+		"address":                       o.PeerEndpoint,
+		"port":                          o.PeerPort,
+		"public_key":                    o.PeerPublicKey,
+		"allowed_ips":                   []string{"0.0.0.0/0", "::/0"},
+		"persistent_keepalive_interval": 25,
+	}
+	if len(o.PeerReserved) > 0 {
+		// sing-box wants []uint8 as a JSON array of decimal ints; matches []byte.
+		peer["reserved"] = o.PeerReserved
+	}
+
+	const tag = "proxy"
+	cfg := singBoxConfig{
+		Log: map[string]any{"level": "info", "timestamp": true},
+		DNS: map[string]any{
+			"servers": []any{
+				map[string]any{"tag": "remote", "type": "udp", "server": "1.1.1.1", "detour": tag},
+				map[string]any{"tag": "local", "type": "local"},
+			},
+			"final": "remote",
+		},
+		Inbounds: []any{
+			map[string]any{
+				"type":         "tun",
+				"tag":          "tun-in",
+				"address":      []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"},
+				"mtu":          1380,
+				"auto_route":   true,
+				"strict_route": true,
+				"stack":        "mixed",
+			},
+		},
+		Endpoints: []any{
+			map[string]any{
+				"type":        "wireguard",
+				"tag":         tag,
+				"system":      false,
+				"mtu":         mtu,
+				"address":     o.LocalAddress,
+				"private_key": o.PrivateKey,
+				"peers":       []any{peer},
+			},
+		},
+		Outbounds: []any{
+			map[string]any{"type": "direct", "tag": "direct"},
+		},
+		Route: map[string]any{
+			"auto_detect_interface":   true,
+			"final":                   tag,
+			"default_domain_resolver": "local",
+			"rules": []any{
+				map[string]any{"action": "sniff"},
+				map[string]any{"protocol": "dns", "action": "hijack-dns"},
 				map[string]any{"ip_version": 6, "action": "reject"},
 				map[string]any{"ip_is_private": true, "action": "route", "outbound": "direct"},
 			},

@@ -46,7 +46,8 @@ var connectCmd = &cobra.Command{
 	Short: "Connect to a free VPN / proxy server (optionally pinned to a country)",
 	Long: `Fetches the current server list, lets you pick a country, then dispatches
 to the right engine (openvpn for VPN protocols, sing-box for shadowsocks /
-vmess / vless / trojan). After the engine reports ready we run a quick
+vmess / vless / trojan / tuic / hysteria2 / wireguard). After the engine
+reports ready we run a quick
 bandwidth probe through the tunnel; if the server is too slow we silently
 try another one. Foreground process — Ctrl-C disconnects.
 
@@ -289,7 +290,7 @@ func dispatchEngine(ctx context.Context, s *backend.Server, onReady func()) (str
 		}
 		return openvpn.Run(ctx, opts)
 
-	case "shadowsocks", "vmess", "vless", "trojan":
+	case "shadowsocks", "vmess", "vless", "trojan", "tuic", "hysteria2", "wireguard":
 		bin, err := proxy.EnsureSingBox(ctx)
 		if err != nil {
 			return "", fmt.Errorf("sing-box: %w", err)

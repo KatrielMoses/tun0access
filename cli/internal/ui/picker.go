@@ -89,7 +89,12 @@ func PickCountry(entries []CountryEntry) (string, error) {
 
 // flag converts an ISO-3166 alpha-2 code into a regional-indicator emoji
 // sequence (e.g. "JP" -> 🇯🇵). Returns the code itself if it isn't 2 letters.
+// Special-cased "XX" — the WARP backend's sentinel for "no country", since
+// 🇽🇽 would otherwise render as Western Sahara (XX is not assigned).
 func flag(cc string) string {
+	if cc == "XX" {
+		return "⚡"
+	}
 	if len(cc) != 2 {
 		return cc
 	}

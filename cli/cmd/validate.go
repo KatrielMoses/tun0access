@@ -51,7 +51,7 @@ var validateCmd = &cobra.Command{
 
 		for i, s := range servers {
 			switch s.Protocol {
-			case "shadowsocks", "vmess", "vless", "trojan", "tuic", "hysteria2":
+			case "shadowsocks", "vmess", "vless", "trojan", "tuic", "hysteria2", "wireguard":
 			default:
 				continue
 			}

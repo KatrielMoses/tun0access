@@ -49,6 +49,19 @@ type Outbound struct {
 	// Hysteria 2
 	ObfsType     string // typically "salamander"
 	ObfsPassword string
+
+	// WireGuard (built programmatically by the WARP backend — no URI form).
+	// LocalAddress holds the addresses sing-box assigns to the TUN-like
+	// interface (e.g. "172.16.0.2/32"). PrivateKey/PeerPublicKey are base64
+	// Curve25519. PeerReserved is the WARP `client_id` decoded — required
+	// for the Cloudflare egress to identify the client correctly.
+	LocalAddress  []string
+	PrivateKey    string
+	PeerPublicKey string
+	PeerEndpoint  string
+	PeerPort      int
+	PeerReserved  []byte
+	MTU           int
 }
 
 // Parse picks the right scheme parser. Returns an error for unsupported
