@@ -14,7 +14,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
+
+	"github.com/KatrielMoses/tun0access/internal/asncheck"
 )
 
 const (
@@ -32,6 +35,8 @@ type Exit struct {
 	CountryCode string // ISO-3166 alpha-2, uppercase
 	CountryName string
 	City        string
+	ASN         uint32 // 0 if unavailable
+	ASOrg       string // human-readable network operator (e.g. "Cloudflare, Inc.")
 }
 
 // Where queries ip-api.com from whatever the OS routes through (i.e. the
@@ -40,7 +45,10 @@ func Where(ctx context.Context) (*Exit, error) {
 	pctx, cancel := context.WithTimeout(ctx, defaultTimeout)
 	defer cancel()
 
-	url := fmt.Sprintf("http://%s/json/?fields=status,country,countryCode,city,query", apiIP)
+	// Request `as` (string like "AS13335 Cloudflare, Inc.") and `asname` so
+	// we can detect WARP-forwarded exits where the exit country happens to
+	// match the labelled country but the exit AS is a known forwarder.
+	url := fmt.Sprintf("http://%s/json/?fields=status,country,countryCode,city,query,as,asname", apiIP)
 	req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -68,6 +76,8 @@ func Where(ctx context.Context) (*Exit, error) {
 		CountryCode string `json:"countryCode"`
 		City        string `json:"city"`
 		Query       string `json:"query"`
+		AS          string `json:"as"`
+		ASName      string `json:"asname"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
 		return nil, fmt.Errorf("exit check decode: %w", err)
@@ -75,10 +85,23 @@ func Where(ctx context.Context) (*Exit, error) {
 	if r.Status != "success" {
 		return nil, fmt.Errorf("ip-api status %q", r.Status)
 	}
+
+	// Parse "AS13335 Cloudflare, Inc." → 13335 + "Cloudflare, Inc."
+	asn := asncheck.ParseASNString(r.AS)
+	asOrg := r.ASName
+	if asOrg == "" && asn != 0 {
+		// Fall back to the descriptive part after "AS<n> "
+		if i := strings.Index(r.AS, " "); i > 0 {
+			asOrg = strings.TrimSpace(r.AS[i+1:])
+		}
+	}
+
 	return &Exit{
 		IP:          r.Query,
 		CountryCode: r.CountryCode,
 		CountryName: r.Country,
 		City:        r.City,
+		ASN:         asn,
+		ASOrg:       asOrg,
 	}, nil
 }

@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/KatrielMoses/tun0access/internal/asncheck"
 	"github.com/KatrielMoses/tun0access/internal/backend"
 	"github.com/KatrielMoses/tun0access/internal/diagnose"
 	"github.com/KatrielMoses/tun0access/internal/exitcheck"
@@ -255,13 +256,28 @@ func attemptConnect(parentCtx context.Context, s *backend.Server) (string, error
 
 			// XX is the explicit "anycast / CDN-fronted" bucket — exit
 			// country varying IS the contract, so we don't enforce a match.
-			if s.CountryShort != "XX" && exit.CountryCode != s.CountryShort {
-				fmt.Printf("  ✗ Exits in %s (%s), not %s as labelled — trying another…\n",
-					exit.City, exit.CountryCode, s.CountryShort)
-				lastExit.Store(exit)
-				geoMismatch.Store(true)
-				cancelRun()
-				return
+			if s.CountryShort != "XX" {
+				if exit.CountryCode != s.CountryShort {
+					fmt.Printf("  ✗ Exits in %s (%s), not %s as labelled — trying another…\n",
+						exit.City, exit.CountryCode, s.CountryShort)
+					lastExit.Store(exit)
+					geoMismatch.Store(true)
+					cancelRun()
+					return
+				}
+				// Country matched. Now check ASN: even if the exit IP geolocates
+				// to the right country, an ASN belonging to Cloudflare /
+				// hyperscaler clouds / known WARP-forwarders means the traffic
+				// is going through anycast and the user isn't really on the
+				// labelled country's local network. Trigger a retry.
+				if susp, reason := asncheck.IsSuspicious(exit.ASN); susp {
+					fmt.Printf("  ✗ Exits via %s (AS%d %s) — that's a forward-chain, not a real %s server. Trying another…\n",
+						reason, exit.ASN, exit.ASOrg, s.CountryShort)
+					lastExit.Store(exit)
+					geoMismatch.Store(true)
+					cancelRun()
+					return
+				}
 			}
 			fmt.Printf("  ✓ %.2f Mbps — exit in %s (%s). Ctrl-C to disconnect.\n",
 				res.Mbps, exit.City, exit.CountryCode)

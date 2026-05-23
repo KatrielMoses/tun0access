@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/KatrielMoses/tun0access/internal/asncheck"
 	"github.com/KatrielMoses/tun0access/internal/cdncheck"
 	"github.com/KatrielMoses/tun0access/internal/geoip"
 	"github.com/KatrielMoses/tun0access/internal/proxy"
@@ -28,6 +29,7 @@ type SSAggregator struct {
 	HTTP *http.Client
 	Geo  *geoip.Resolver
 	CDN  *cdncheck.Detector
+	ASN  *asncheck.Database
 
 	mu       sync.Mutex
 	cache    []Server
@@ -60,6 +62,7 @@ func NewSSAggregator() *SSAggregator {
 		HTTP: &http.Client{Timeout: 30 * time.Second},
 		Geo:  geoip.New(),
 		CDN:  cdncheck.New(),
+		ASN:  asncheck.New(),
 	}
 }
 
@@ -120,12 +123,25 @@ func (a *SSAggregator) Fetch(ctx context.Context) ([]Server, error) {
 		return nil, fmt.Errorf("ss-aggregator: no parseable URIs found across %d source(s)", len(sources))
 	}
 
+	// Kick off ASN dataset prep in parallel with the GeoIP batch — the
+	// download is ~9 MB so we don't want it serialized after another HTTP
+	// step. If it fails we just skip the ASN enrichment.
+	asnReady := make(chan struct{})
+	go func() {
+		_ = a.ASN.Prepare(ctx)
+		close(asnReady)
+	}()
+
 	// GeoIP-tag every unique host.
 	hosts := make([]string, 0, len(items))
 	for _, it := range items {
 		hosts = append(hosts, it.out.Server)
 	}
 	geoMap := a.Geo.ResolveMany(ctx, hosts)
+
+	// Wait for ASN dataset before materializing (typically already done
+	// by this point — both run concurrently for the duration of GeoIP).
+	<-asnReady
 
 	// Materialize Server entries.
 	var servers []Server
@@ -152,6 +168,21 @@ func (a *SSAggregator) Fetch(ctx context.Context) ([]Server, error) {
 		if country == "" {
 			continue // skip hosts we couldn't locate at all
 		}
+
+		// ASN enrichment. Forwarder ASNs (Cloudflare, M247, Zenlayer,
+		// hyperscaler clouds, etc.) are heavily correlated with the
+		// "exits in user's country instead of labelled country" failure
+		// mode. We DEPRIORITIZE rather than drop, because (a) some legit
+		// servers also live on those ASNs and (b) the runtime exit-ASN
+		// check still catches them if they slip through.
+		score := 25 // baseline
+		if ipAddr.IsValid() {
+			if asn, _, susp, _ := a.ASN.DetectByIP(ipAddr); susp {
+				score = 5 // sinks below every clean server in pickServer
+				_ = asn
+			}
+		}
+
 		cfgJSON, err := json.Marshal(it.out)
 		if err != nil {
 			continue
@@ -162,7 +193,7 @@ func (a *SSAggregator) Fetch(ctx context.Context) ([]Server, error) {
 			CountryLong:  countryName,
 			CountryShort: country,
 			Host:         it.out.Server,
-			Score:        25, // baseline; health checker will rerank these
+			Score:        int64(score),
 			Protocol:     it.out.Protocol,
 			Config:       cfgJSON,
 		})
