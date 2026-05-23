@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/KatrielMoses/tun0access/internal/cdncheck"
 	"github.com/KatrielMoses/tun0access/internal/geoip"
 	"github.com/KatrielMoses/tun0access/internal/proxy"
 )
@@ -25,6 +27,7 @@ import (
 type SSAggregator struct {
 	HTTP *http.Client
 	Geo  *geoip.Resolver
+	CDN  *cdncheck.Detector
 
 	mu       sync.Mutex
 	cache    []Server
@@ -56,6 +59,7 @@ func NewSSAggregator() *SSAggregator {
 	return &SSAggregator{
 		HTTP: &http.Client{Timeout: 30 * time.Second},
 		Geo:  geoip.New(),
+		CDN:  cdncheck.New(),
 	}
 }
 
@@ -127,8 +131,26 @@ func (a *SSAggregator) Fetch(ctx context.Context) ([]Server, error) {
 	var servers []Server
 	for _, it := range items {
 		geo := geoMap[it.out.Server]
-		if geo.CountryCode == "" {
-			continue // skip hosts we couldn't locate; UI would group them under "??"
+		country := geo.CountryCode
+		countryName := geo.CountryName
+
+		// CDN / anycast override. Many free Trojan/VLESS configs point at
+		// Cloudflare-fronted domains — the TLS handshake terminates at the
+		// CDN POP nearest to the *user*, not at the labelled country. We
+		// detect these by (a) hostname suffix patterns and (b) the resolved
+		// IP falling inside a published CDN CIDR. When matched, relabel as
+		// `XX / Anycast` so the picker stops lying about country.
+		var ipAddr netip.Addr
+		if geo.IP != "" {
+			ipAddr, _ = netip.ParseAddr(geo.IP)
+		}
+		if isCDN, _ := a.CDN.Detect(it.out.Server, ipAddr); isCDN {
+			country = "XX"
+			countryName = "Anycast / CDN-fronted"
+		}
+
+		if country == "" {
+			continue // skip hosts we couldn't locate at all
 		}
 		cfgJSON, err := json.Marshal(it.out)
 		if err != nil {
@@ -137,8 +159,8 @@ func (a *SSAggregator) Fetch(ctx context.Context) ([]Server, error) {
 		servers = append(servers, Server{
 			ID:           fmt.Sprintf("ss:%s:%d", it.out.Server, it.out.ServerPort),
 			Backend:      "ss-aggregator",
-			CountryLong:  geo.CountryName,
-			CountryShort: geo.CountryCode,
+			CountryLong:  countryName,
+			CountryShort: country,
 			Host:         it.out.Server,
 			Score:        25, // baseline; health checker will rerank these
 			Protocol:     it.out.Protocol,

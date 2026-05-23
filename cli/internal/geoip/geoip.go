@@ -39,6 +39,10 @@ const (
 type Result struct {
 	CountryCode string
 	CountryName string
+	// IP is the resolved IPv4 (or IPv6 if no v4 record exists) used to do
+	// the country lookup. Exposed so downstream callers (e.g. CDN detection)
+	// can run their own checks without re-resolving the hostname.
+	IP string
 }
 
 // Resolver is a country-code lookup cache that batches requests.
@@ -136,13 +140,16 @@ func (r *Resolver) ResolveMany(ctx context.Context, hosts []string) map[string]R
 		}
 	}
 
-	// 5. Fill output, populate cache.
+	// 5. Fill output, populate cache. We stamp the resolved IP onto every
+	// Result so downstream callers (CDN detection, debugging) don't have to
+	// re-resolve.
 	r.mu.Lock()
 	for h, ip := range hostToIP {
 		var res Result
 		if ip != "" {
 			res = ipToResult[ip]
 		}
+		res.IP = ip
 		out[h] = res
 		r.cache[h] = res
 	}

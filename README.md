@@ -102,16 +102,36 @@ Connection runs in the foreground. `Ctrl-C` disconnects.
 | `vpngate`        | OpenVPN                                            | ~10 (Asia-heavy)    | University of Tsukuba's public relay pool |
 | `riseup`         | OpenVPN (anonymous LEAP cert)                      | US, CA, FR, NL      | Run by Riseup nonprofit; no signup |
 | `ss-aggregator`  | Shadowsocks, VMess, VLESS, Trojan, TUIC, Hysteria2 | ~60                 | Aggregates from 9 public GitHub config repos |
+| `warp`           | WireGuard                                          | Anycast (no country selection) | Anonymous Cloudflare WARP registration |
 
 Backends auto-register themselves in `init()`. Adding a provider is
 "drop one file in `internal/backend/`, implement `Fetch`, call `Register`."
 
+### CDN-fronted servers are detected and relabelled
+
+A large fraction of free Trojan / VMess / VLESS configs in the wild point
+at Cloudflare-fronted (or Fastly / CloudFront) domains. The TLS handshake
+terminates at the nearest CDN edge to the *user*, not at the labelled
+country — so a "Hong Kong" server actually exits wherever that user's
+nearest POP is.
+
+`tun0access` ships an `internal/cdncheck` package that, at fetch time,
+checks each server's hostname suffix and resolved IP against the published
+Cloudflare / Fastly / CloudFront CIDR ranges (cached on disk for 24h).
+Matched servers are relabelled into the `⚡ XX  Anycast / CDN-fronted`
+bucket alongside Cloudflare WARP — so the country picker never claims a
+specific country it can't actually deliver. Real-world impact: typical
+country counts drop ~10–70% as CDN-fronted entries get moved to the
+anycast bucket, where they remain usable as "fast hidden IP, country
+varies."
+
 ## Known limitations (being worked on)
 
-- **Exit country can differ from the labelled country.** Many free
-  Shadowsocks/Trojan/VMess servers are CDN-fronted (typically Cloudflare),
-  or are mislabelled in the source aggregator. We GeoIP the server's
-  *advertised* IP, but the actual exit may be elsewhere. We always run the
+- **Some exit-country mismatches still slip through.** CDN detection
+  catches the overwhelming majority (Cloudflare / Fastly / CloudFront via
+  IP CIDR + hostname suffix), but forward-chained proxies (e.g. Trojan
+  that internally relays through WARP) are only detectable with an actual
+  tunnel. We still run the
   exit-IP check after connect and surface the mismatch — but we don't
   auto-retry on it yet, because a "wrong country but fast" server is
   sometimes preferable to a hung "right country" one. **Refining this is

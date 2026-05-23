@@ -27,10 +27,12 @@ import (
 const (
 	// readyDeadline bounds the "connecting…" phase of each attempt.
 	readyDeadline = 45 * time.Second
-	// maxAttempts is the per-country retry ceiling. Beyond this, the user
-	// gets a clear "all servers in <country> are dead" message and can pick
-	// a different country.
-	maxAttempts = 3
+	// maxAttempts is the per-country retry ceiling. With CDN detection at
+	// ingest (v0.4.8) the candidate pool is much cleaner, but a few servers
+	// still slip through and exit in the wrong country — five tries gives
+	// the auto-retry-on-mismatch logic enough headroom to land on a real
+	// in-country server within a few seconds.
+	maxAttempts = 5
 )
 
 var (
@@ -146,6 +148,12 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		case verdictUnreachable:
 			lastReason = "tunnel up but couldn't reach the internet"
 			continue
+		case verdictGeoMismatch:
+			lastReason = "server exited in the wrong country"
+			if e := lastExit.Load(); e != nil {
+				lastReason = fmt.Sprintf("server exited in %s (%s), not %s", e.City, e.CountryCode, cc)
+			}
+			continue
 		case verdictEngineFailed:
 			// Engine blew up before we could probe. Most common cause is a
 			// server-specific config quirk that our parser didn't catch (new
@@ -180,7 +188,12 @@ const (
 	verdictSlow                        // probe came back under MinUsableMbps
 	verdictUnreachable                 // probe failed entirely
 	verdictEngineFailed                // engine crashed before we could probe
+	verdictGeoMismatch                 // probe + speed ok, but exit IP is in the wrong country
 )
+
+// lastExit stashes the most recent exit-IP result so the retry-loop can
+// quote it in failure messages without complex value passing. Reset per attempt.
+var lastExit atomic.Pointer[exitcheck.Exit]
 
 // lastMbps stores the most recent measured throughput (×100, fixed-point) so
 // retry messages can quote it without complex value passing. It's reset per
@@ -191,12 +204,13 @@ var lastMbps atomic.Int64
 // probe in the background, cancel engine if probe is bad. Returns captured
 // engine output, the engine's exit error, and a verdict the loop uses.
 func attemptConnect(parentCtx context.Context, s *backend.Server) (string, error, verdict) {
-	// Two flags the probe goroutine sets so the caller knows why the engine
+	// Flags the probe goroutine sets so the caller knows why the engine
 	// stopped.
 	var (
 		probeRan    atomic.Bool
 		probeSlow   atomic.Bool
 		probeFailed atomic.Bool
+		geoMismatch atomic.Bool
 	)
 
 	// Engine context: we cancel it from the probe when the server is bad.
@@ -231,15 +245,22 @@ func attemptConnect(parentCtx context.Context, s *backend.Server) (string, error
 			// the user cares about the exit, not the label.
 			exit, exitErr := exitcheck.Where(runCtx)
 			if exitErr != nil {
-				// Exit check failed — show speed only and keep going.
-				fmt.Printf("  ✓ %.2f Mbps — ready. Ctrl-C to disconnect.\n", res.Mbps)
+				// Exit check failed — show speed only and keep going. We
+				// can't tell whether the country is right, but the tunnel
+				// passes traffic, which is the bar the user actually cares
+				// about. Don't penalise transient ip-api.com hiccups.
+				fmt.Printf("  ✓ %.2f Mbps — ready (exit country unknown). Ctrl-C to disconnect.\n", res.Mbps)
 				return
 			}
-			if exit.CountryCode != s.CountryShort {
-				fmt.Printf("  ⚠ %.2f Mbps — but you're exiting in %s (%s), not %s as labelled.\n",
-					res.Mbps, exit.City, exit.CountryCode, s.CountryShort)
-				fmt.Println("    (Free-config servers are often CDN-fronted or mislabelled.)")
-				fmt.Println("    Ctrl-C to disconnect and try another, or stay if this works for you.")
+
+			// XX is the explicit "anycast / CDN-fronted" bucket — exit
+			// country varying IS the contract, so we don't enforce a match.
+			if s.CountryShort != "XX" && exit.CountryCode != s.CountryShort {
+				fmt.Printf("  ✗ Exits in %s (%s), not %s as labelled — trying another…\n",
+					exit.City, exit.CountryCode, s.CountryShort)
+				lastExit.Store(exit)
+				geoMismatch.Store(true)
+				cancelRun()
 				return
 			}
 			fmt.Printf("  ✓ %.2f Mbps — exit in %s (%s). Ctrl-C to disconnect.\n",
@@ -258,6 +279,9 @@ func attemptConnect(parentCtx context.Context, s *backend.Server) (string, error
 	}
 	if probeFailed.Load() {
 		return output, runErr, verdictUnreachable
+	}
+	if geoMismatch.Load() {
+		return output, runErr, verdictGeoMismatch
 	}
 	// Engine exited before probe even started (or before it finished and
 	// without us cancelling). That's an engine-side failure.

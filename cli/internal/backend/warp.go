@@ -52,7 +52,7 @@ const (
 	// flag-rendering in ui/picker.go special-cases this code to skip the
 	// regional-indicator letter trick.
 	warpCountryCode = "XX"
-	warpCountryName = "Anywhere — Cloudflare WARP"
+	warpCountryName = "Anycast / CDN-fronted"
 )
 
 // WARP is the Cloudflare WARP backend.
