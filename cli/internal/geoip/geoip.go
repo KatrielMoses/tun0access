@@ -26,10 +26,12 @@ import (
 
 const (
 	apiURL          = "http://ip-api.com/batch?fields=status,country,countryCode,query"
+	fallbackURL     = "https://get.geojs.io/v1/ip/country/" // append <ip>.json
 	batchSize       = 100
 	httpTimeout     = 15 * time.Second
 	dnsTimeout      = 3 * time.Second
 	dnsConcurrency  = 50
+	fallbackWorkers = 25
 	diskCacheMaxAge = 24 * time.Hour
 )
 
@@ -100,8 +102,7 @@ func (r *Resolver) ResolveMany(ctx context.Context, hosts []string) map[string]R
 	}
 
 	// 4. Batch ip-api.com lookups. On 429 the loop just keeps going — those
-	// IPs will be missing from ipToResult and the hosts get empty results
-	// (still better than blocking).
+	// IPs are picked up by the geojs.io fallback below.
 	ipToResult := map[string]Result{}
 	for i := 0; i < len(ipsToQuery); i += batchSize {
 		end := i + batchSize
@@ -114,6 +115,24 @@ func (r *Resolver) ResolveMany(ctx context.Context, hosts []string) map[string]R
 		}
 		for ip, res := range results {
 			ipToResult[ip] = res
+		}
+	}
+
+	// 4b. Fallback: any IP that's still unresolved (ip-api.com 429'd, returned
+	// status:fail, or the batch errored entirely) gets a single-IP call to
+	// geojs.io, which has no observed rate limit. Worker pool keeps it fast.
+	var missing []string
+	for _, ip := range ipsToQuery {
+		if res, ok := ipToResult[ip]; !ok || res.CountryCode == "" {
+			missing = append(missing, ip)
+		}
+	}
+	if len(missing) > 0 {
+		fallback := r.geojsFallbackMany(ctx, missing, fallbackWorkers)
+		for ip, res := range fallback {
+			if res.CountryCode != "" {
+				ipToResult[ip] = res
+			}
 		}
 	}
 
@@ -197,6 +216,68 @@ func (r *Resolver) batch(ctx context.Context, ips []string) (map[string]Result, 
 		}
 	}
 	return out, nil
+}
+
+// geojsFallbackMany runs single-IP geojs.io lookups concurrently. Used to
+// pick up IPs that ip-api.com couldn't / wouldn't resolve (rate-limited or
+// flagged status:fail). geojs.io has no observed rate cap and a minimal
+// response shape (`{"country":"US","name":"United States","ip":"..."}`).
+func (r *Resolver) geojsFallbackMany(ctx context.Context, ips []string, workers int) map[string]Result {
+	out := make(map[string]Result, len(ips))
+	var mu sync.Mutex
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for _, ip := range ips {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(ip string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			res := r.geojsLookup(ctx, ip)
+			mu.Lock()
+			out[ip] = res
+			mu.Unlock()
+		}(ip)
+	}
+	wg.Wait()
+	return out
+}
+
+type geojsEntry struct {
+	Country string `json:"country"` // ISO alpha-2
+	Name    string `json:"name"`
+}
+
+func (r *Resolver) geojsLookup(ctx context.Context, ip string) Result {
+	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(pctx, http.MethodGet, fallbackURL+ip+".json", nil)
+	if err != nil {
+		return Result{}
+	}
+	resp, err := r.HTTP.Do(req)
+	if err != nil {
+		return Result{}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return Result{}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	if err != nil {
+		return Result{}
+	}
+	var e geojsEntry
+	if err := json.Unmarshal(body, &e); err != nil {
+		return Result{}
+	}
+	if e.Country == "" {
+		return Result{}
+	}
+	return Result{
+		CountryCode: strings.ToUpper(e.Country),
+		CountryName: e.Name,
+	}
 }
 
 // toIP returns the dotted IPv4 form for a host. If the input is already an
